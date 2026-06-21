@@ -1082,7 +1082,7 @@ const normalizeRobotUrl = (rawUrl: string): string => {
 1. `rawUrl.trim()`：去除字符串前后空白字符
 2. `new URL(...)`：用 WHATWG URL 构造器解析，解析失败直接抛错
 3. 协议校验：仅允许 `http:` 或 `https:`，否则抛 `Invalid URL protocol`
-4. `normalizedUrl.search = normalizedUrl.searchParams.toString()`：通过 `searchParams` 重新序列化查询字符串（统一参数顺序和 URL 编码格式）
+4. `normalizedUrl.search = normalizedUrl.searchParams.toString()`：将查询字符串经 `searchParams` 重新序列化写回（规范化 percent-encoding；参数顺序保持原样，不做排序）
 5. `normalizedUrl.toString()`：输出完整 URL 字符串
 
 **代码未执行的操作（明确排除）**：
@@ -1108,7 +1108,7 @@ const normalizeUrl = (raw: string): string => {
 
 **实际执行的操作（严格按代码）**：
 1. `new URL(raw)`：解析 URL，失败则降级为 `raw.toLowerCase().trim()`
-2. `u.search = u.searchParams.toString()`：重新序列化查询参数
+2. `u.search = u.searchParams.toString()`：将查询字符串经 `searchParams` 重新序列化写回（规范化 percent-encoding；参数顺序保持原样，不做排序）
 3. `u.host.toLowerCase()`：主机名转小写
 4. `u.pathname.replace(/\/$/, '')`：移除 pathname 末尾的单个斜杠
 5. 手动拼接：`protocol + // + host(小写) + pathname(去尾斜杠) + search`
@@ -1353,7 +1353,7 @@ JSON.stringify(obj) 自动序列化
 │  normalizeRobotUrl 实际执行：                                            │
 │    1. rawUrl.trim()                     ← 去前后空白                    │
 │    2. new URL(...) 解析 + 协议校验        ← 仅 http/https                │
-│    3. search = searchParams.toString()   ← 重新序列化 query              │
+│    3. search = searchParams.toString()   ← 规范化 percent-encoding          │
 │    4. .toString() 输出                   ← 完整 URL 字符串               │
 │    （代码未执行：主机小写 / 去尾斜杠，两者仅 normalizeUrl 比较时才做）       │
 │                                                                         │
@@ -1441,7 +1441,7 @@ JSON.stringify(obj) 自动序列化
 3. **加密一致性**：SDK 的 `type` 动作直接调用 `encrypt()`，跳过了 GUI 的逐键 `press` → 优化为 `type` 的过程，但加密算法（AES-256-CBC，输出 `ivHex:ciphertextHex`）和存储格式与 GUI 路径完全相同
 
 4. **URL 规范化的明确边界**：
-   - `normalizeRobotUrl` 做：`trim()` → 协议校验 → `searchParams.toString()` 重新序列化 query → `.toString()` 输出
+   - `normalizeRobotUrl` 做：`trim()` → 协议校验 → `searchParams.toString()` 规范化 percent-encoding → `.toString()` 输出（参数顺序保持原样，不做排序）
    - `normalizeRobotUrl` **不做**：主机名小写、尾斜杠去除（这两者仅存在于 `normalizeUrl`，且仅用于同名机器人比较场景）
    - `normalizeWorkflowUrls` 遍历：`where.url`、`goto.args[0]`、`scrape/crawl.args[0].url` 三处，字面量 `'about:blank'` 一律跳过
    - SDK 路径中调用时序：enricher 输出后 1 次、入口 URL 1 次、写库前再 1 次
