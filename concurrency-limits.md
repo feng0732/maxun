@@ -2,24 +2,72 @@
 
 ## 概述
 
-Maxun 项目采用**三层并发控制架构**来管理任务执行和资源使用：
+Maxun 项目采用**三层并发控制 + 两层排队机制**来管理任务执行和资源使用：
 
+**三层并发控制：**
 1. **全局任务队列层**：基于 Graphile Worker 的 PostgreSQL 任务队列，控制系统级并发
 2. **浏览器资源池层**：BrowserPool 管理浏览器实例，实施"1 用户 - 2 浏览器"策略
 3. **工作流内部并发层**：Concurrency 类管理单个工作流内的多任务并发执行
+
+**两层排队机制：**
+1. **应用层排队**：当浏览器槽位不足时，Run 记录标记为 `queued` 状态等待
+2. **Graphile Worker 队列**：真正的异步任务队列，由 Worker 池消费
 
 ---
 
 ## 一、任务排队机制
 
-### 1.1 Graphile Worker 任务队列
+### 1.1 两层排队架构
 
-系统使用 [Graphile Worker](https://github.com/graphile/worker) 作为基于 PostgreSQL 的任务队列，实现任务的持久化排队和调度。
+系统存在两个独立但关联的排队层级：
+
+#### 第一层：应用层排队（Application-Level Queue）
+
+当用户浏览器槽位已满时，任务不直接进入 Worker 队列，而是在应用层排队：
+
+**核心逻辑**：[storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1018-L1124)
+
+```typescript
+const canCreateBrowser = await browserPool.hasAvailableBrowserSlots(req.user.id, "run");
+
+if (canCreateBrowser) {
+  // 路径A：有可用槽位 → 立即创建浏览器 + 入队 Worker
+  const browserId = await createRemoteBrowserForRun(req.user.id);
+  await Run.create({ status: 'running', ... });
+  await addJob(QUEUE_NAMES.EXECUTE_RUN, { ... });
+  return { queued: false };
+} else {
+  // 路径B：无可用槽位 → 应用层排队，返回 queued: true
+  await Run.create({ 
+    status: 'queued', 
+    log: 'Run queued - waiting for available browser slot',
+    ... 
+  });
+  return { queued: true };
+}
+```
+
+**排队任务触发**：[processQueuedRuns](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1493-L1566)
+
+每 5 秒轮询一次（在 [server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/server.ts#L151-L158) 中设置）：
+
+```typescript
+const processQueuedRunsInterval = setInterval(async () => {
+  await processQueuedRuns();
+}, 5000);
+```
+
+**processQueuedRuns 执行流程**：
+1. 查询最早的 `status: 'queued'` 运行记录
+2. 检查该用户是否有可用浏览器槽位
+3. 如有槽位：创建浏览器 → 更新 Run 为 `running` → 加入 Worker 队列
+4. 如无槽位：跳过，等待下一次轮询
+
+#### 第二层：Graphile Worker 任务队列
 
 **核心文件**：[graphileWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/storage/graphileWorker.ts)
 
 ```typescript
-// 任务入队函数
 export async function addJob(
   taskIdentifier: string,
   payload: Record<string, unknown>,
@@ -27,40 +75,19 @@ export async function addJob(
 ): Promise<string>
 ```
 
-**关键特性**：
-- 任务持久化存储在 PostgreSQL 中
-- 支持任务重试（`maxAttempts` 参数）
-- 支持定时执行（`runAt` 参数）
-- 支持任务去重（`jobKey` 参数）
+### 1.2 所有 EXECUTE_RUN 入队入口
 
-### 1.2 任务类型定义
+| 入口位置 | 代码行 | 触发场景 |
+|----------|--------|----------|
+| [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1069) | L1069 | 用户手动运行机器人（有浏览器槽位时） |
+| [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1188) | L1188 | 用户重试运行 |
+| [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1539) | L1539 | processQueuedRuns 处理排队任务 |
+| [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L2047) | L2047 | 验证 API 触发运行 |
+| [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L2103) | L2103 | 另一个 API 运行入口 |
+| [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L116) | L116 | 定时调度器创建 DocRobot 运行 |
+| [record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/api/record.ts#L632) | L632 | SDK API 触发运行 |
 
-**核心文件**：[task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L37-L45)
-
-```typescript
-export const QUEUE_NAMES = {
-  INITIALIZE_BROWSER_RECORDING: 'initialize-browser-recording',
-  DESTROY_BROWSER: 'destroy-browser',
-  INTERPRET_WORKFLOW: 'interpret-workflow',
-  STOP_INTERPRETATION: 'stop-interpretation',
-  EXECUTE_RUN: 'execute-run',
-  ABORT_RUN: 'abort-run',
-  SCHEDULED_WORKFLOW: 'scheduled-workflow',
-} as const;
-```
-
-### 1.3 任务入队入口
-
-任务可以从多个路径入队：
-
-| 入口 | 文件 | 说明 |
-|------|------|------|
-| 定时调度 | [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/schedule-worker.ts) | 轮询数据库找到期任务，加入 SCHEDULED_WORKFLOW 队列 |
-| 工作流调度 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts) | 调度运行时创建任务，加入 EXECUTE_RUN 队列 |
-| API 触发 | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts) | REST API 调用直接入队 |
-| SDK API | [record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/api/record.ts) | SDK API 调用入队 |
-
-### 1.4 定时调度流程
+### 1.3 定时调度流程
 
 **核心文件**：[schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/schedule-worker.ts)
 
@@ -69,8 +96,20 @@ export const QUEUE_NAMES = {
 2. 使用 PostgreSQL 咨询锁（`pg_try_advisory_xact_lock`）保证多实例安全
 3. 批量获取到期任务（`DB_SCHEDULER_BATCH_SIZE = 10`）
 4. 声明（claim）任务并更新 `schedulerClaimedAt` 时间戳
-5. 将任务加入 Graphile Worker 队列
+5. 调用 `createWorkflowAndStoreMetadata` 创建运行（内部检查浏览器槽位）
 6. 成功后更新 `nextRunAt`，失败则释放声明
+
+**关键点**：定时调度不直接入队，而是调用调度器创建运行，调度器内部会走应用层排队逻辑。
+
+### 1.4 服务启动恢复机制
+
+**核心函数**：[recoverOrphanedRuns](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1572-L1655)
+
+服务启动时执行一次：
+1. 查询所有 `status: 'running'` 或 `status: 'scheduled'` 的运行
+2. 检查浏览器是否还在池中
+3. 如浏览器不存在且重试次数 < 3：将状态改为 `queued` 重新排队
+4. 如重试次数 >= 3：标记为 `failed`
 
 ---
 
@@ -86,8 +125,7 @@ const TOTAL_CONCURRENCY = Math.max(1, parseInt(process.env.WORKER_CONCURRENCY ||
 
 **配置说明**：
 - 环境变量 `WORKER_CONCURRENCY` 控制总并发数
-- 默认值为 10
-- 最小值为 1
+- 默认值为 10，最小值为 1
 - 对应 Graphile Worker 的 `concurrency` 参数
 
 **Worker 启动配置**：
@@ -96,7 +134,7 @@ runner = await run({
   pgPool: runnerPool,
   concurrency: TOTAL_CONCURRENCY,
   noHandleSignals: true,
-  pollInterval: 3600000,  // 1小时轮询间隔（依赖监听通知）
+  pollInterval: 3600000,  // 1小时轮询间隔（依赖 LISTEN/NOTIFY）
   taskList,
 });
 ```
@@ -107,7 +145,7 @@ runner = await run({
 
 #### 2.2.1 资源限额策略
 
-**"1 用户 - 2 浏览器"策略**：
+**"1 用户 - 2 浏览器"硬编码策略**：
 - 每个用户最多拥有 2 个浏览器实例
 - 每个用户最多只能有 1 个处于 "recording" 状态的浏览器
 - "run" 状态的浏览器可以有 1-2 个（取决于是否还有 recording 浏览器）
@@ -117,50 +155,36 @@ runner = await run({
 ```typescript
 public hasAvailableBrowserSlots = (userId: string, state?: BrowserState): boolean => {
   const userBrowserIds = this.userToBrowserMap.get(userId) || [];
-  
-  if (userBrowserIds.length >= 2) {
-    return false;
-  }
-  
+  if (userBrowserIds.length >= 2) return false;
   if (state === "recording") {
     const hasBrowserInState = userBrowserIds.some(browserId => 
       this.pool[browserId] && this.pool[browserId].state === "recording"
     );
     return !hasBrowserInState;
   }
-  
   return true;
 };
 ```
 
 #### 2.2.2 原子预约机制
 
-为防止并发请求导致的资源超限，BrowserPool 实现了**原子预约**机制：
-
 **核心方法**：[reserveBrowserSlotAtomic](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L595-L646)
 
 ```typescript
 public reserveBrowserSlotAtomic = (id: string, userId: string, state: BrowserState = "run"): boolean => {
   const lockKey = `${userId}-${state}`;
-  
-  if (this.reservationLocks.has(lockKey)) {
-    return false;
-  }
+  if (this.reservationLocks.has(lockKey)) return false;
   
   try {
     this.reservationLocks.set(lockKey, Date.now());
+    if (!this.hasAvailableBrowserSlots(userId, state)) return false;
     
-    if (!this.hasAvailableBrowserSlots(userId, state)) {
-      return false;
-    }
-    
-    // 创建 reserved 状态的槽位
     this.pool[id] = {
       browser: null,
       active: false,
       userId,
       state,
-      status: "reserved",
+      status: "reserved",  // 注意：设置为 reserved
       createdAt: now,
       lastAccessed: now,
     };
@@ -179,25 +203,51 @@ public reserveBrowserSlotAtomic = (id: string, userId: string, state: BrowserSta
 };
 ```
 
-**浏览器槽位状态**：
-| 状态 | 说明 |
-|------|------|
-| `reserved` | 已预约，浏览器实例尚未创建 |
-| `initializing` | 初始化中 |
-| `ready` | 就绪，可使用 |
-| `failed` | 初始化失败 |
+#### 2.2.3 浏览器槽位状态（重要发现）
 
-**状态流转**：
-```
-reserved → initializing → ready
-                ↓
-              failed
+**类型定义**中的状态：[BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L36-L38)
+
+```typescript
+status?: "reserved" | "initializing" | "ready" | "failed",
 ```
 
-#### 2.2.3 槽位升级与失败处理
+**⚠️ 关键发现：`initializing` 状态从未被实际设置！**
 
-- **升级槽位**：[upgradeBrowserSlot](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L655-L670) - 将 `reserved` 状态升级为 `ready`
-- **标记失败**：[failBrowserSlot](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L677-L696) - 失败时清理资源并移除槽位
+代码核查结果：
+- 全局搜索 `status = 'initializing'` 或 `status: 'initializing'` 无任何匹配
+- `reserveBrowserSlotAtomic` 设置状态为 `"reserved"`
+- `upgradeBrowserSlot` 直接从 `"reserved"` 升级为 `"ready"`
+- 失败时调用 `failBrowserSlot` 设置为 `"failed"`
+
+**实际状态流转**：
+```
+reserved → (异步初始化进行中，status 保持 reserved) → ready
+                    ↓
+                  failed
+```
+
+**代码缺陷说明**：
+- `cleanupStaleBrowserSlots` 方法检查 `info.status === "initializing"`，但这个状态永远不会出现
+- 实际只需要检查 `status === "reserved"` 即可覆盖所有未就绪情况
+- 浏览器初始化过程在 `initializeBrowserAsync` 中异步进行，但期间状态一直是 `reserved`
+
+**Worker 等待浏览器就绪**：[task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L187-L213)
+
+```typescript
+while (!browser && (Date.now() - browserWaitStart) < BROWSER_INIT_TIMEOUT && pollAttempts < MAX_POLL_ATTEMPTS) {
+  const browserStatus = browserPool.getBrowserStatus(browserId);
+  if (browserStatus === null) throw new Error(`Browser slot ${browserId} does not exist in pool`);
+  if (browserStatus === 'failed') throw new Error(`Browser ${browserId} initialization failed`);
+  
+  await new Promise(resolve => setTimeout(resolve, 2000));
+  browser = browserPool.getRemoteBrowser(browserId);
+}
+```
+
+#### 2.2.4 槽位升级与失败处理
+
+- **升级槽位**：[upgradeBrowserSlot](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L655-L670) - 检查当前状态为 `reserved`，然后设置 `status = "ready"` 并关联 browser 对象
+- **标记失败**：[failBrowserSlot](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L677-L696) - 调用 `deleteRemoteBrowser` 从池中移除
 
 ### 2.3 工作流内部并发（Concurrency 类）
 
@@ -258,17 +308,13 @@ this.concurrency = new Concurrency(this.options.maxConcurrency);
 在处理弹窗或多页面时，使用并发控制管理多个页面的工作流执行：
 
 ```typescript
-// 用户触发的并发由 Concurrency 管理器完全控制
 this.concurrency.addJob(() => this.runLoop(popup, workflowCopy));
 ```
 
 #### 2.4.3 主循环启动
 
 ```typescript
-// 添加主循环任务
 this.concurrency.addJob(() => this.runLoop(page, this.initializedWorkflow!));
-
-// 等待所有并发任务完成
 await this.concurrency.waitForCompletion();
 ```
 
@@ -296,7 +342,6 @@ await this.concurrency.waitForCompletion();
 const DESTROY_TIMEOUT = 30000; // 30秒超时
 
 const destroyPromise = (async () => { /* 销毁逻辑 */ })();
-
 const timeoutPromise = new Promise<boolean>((_, reject) =>
   setTimeout(() => reject(new Error(`Browser destruction timed out after ${DESTROY_TIMEOUT}ms`)), DESTROY_TIMEOUT)
 );
@@ -306,33 +351,70 @@ return await Promise.race([destroyPromise, timeoutPromise]);
 
 超时后强制从池中删除浏览器记录。
 
-### 3.2 异常时的资源释放
+### 3.2 完整资源释放路径汇总
 
-#### 3.2.1 执行失败时释放
+| 触发场景 | 代码位置 | 释放函数 |
+|----------|----------|----------|
+| **正常完成** | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts) | `processRunExecution` 末尾 → `destroyRemoteBrowser` |
+| **执行失败** | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts) | catch 块 → `destroyRemoteBrowser` |
+| **用户中止** | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L584-L629) | `abortRun` → `destroyRemoteBrowser` |
+| **录制超时** | [controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/controller.ts#L14-L15) | `setTimeout` 回调 → `destroyRemoteBrowser` |
+| **槽位过期清理** | [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L702-L729) | `cleanupStaleBrowserSlots` → `failBrowserSlot` |
+| **浏览器创建失败** | [controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/controller.ts#L466-L478) | `initializeBrowserAsync` catch → `failBrowserSlot` |
+| **Run 创建数据库错误** | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1056-L1063) | catch 块 → `destroyRemoteBrowser` |
+| **入队失败** | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1076-L1089) | catch 块 → `destroyRemoteBrowser` |
+| **调度器成功完成** | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L655) | 成功路径 → `destroyRemoteBrowser` |
+| **调度器执行失败** | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L763-L766) | catch 块 → `destroyRemoteBrowser` |
+| **录制完成/失败** | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L842-L849) | `readyForRunHandler` → `destroyRemoteBrowser` |
+| **服务启动清理** | [server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/server.ts#L170-L171) | `browserPool.cleanupStaleBrowserSlots()` |
+| **服务优雅关闭** | [server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/server.ts#L220-L260) | SIGINT 处理 → 遍历所有浏览器保存数据后关闭 |
 
-**核心文件**：[task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts)
+### 3.3 定时清理机制
 
-在 `processRunExecution` 函数中，无论成功或失败，最终都会调用 `destroyRemoteBrowser`：
+**服务启动时**：[server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/server.ts#L170-L171)
 
 ```typescript
-// 成功路径
-await destroyRemoteBrowser(browserId, data.userId);
-
-// 失败路径
-try { if (browser && browser.interpreter) await browser.interpreter.clearState(); } catch (_) {}
-await destroyRemoteBrowser(browserId, data.userId);
+logger.log('info', 'Cleaning up stale browser slots...');
+browserPool.cleanupStaleBrowserSlots();
 ```
 
-#### 3.2.2 中止运行时释放
-
-**核心函数**：[abortRun](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L584-L629)
+**每分钟清理**：[server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/server.ts#L160-L163)
 
 ```typescript
-await new Promise(resolve => setTimeout(resolve, 500));
-await destroyRemoteBrowser(plainRun.browserId, userId);
+const browserPoolCleanupInterval = setInterval(() => {
+  browserPool.cleanupStaleBrowserSlots();
+}, 60000);  // 每分钟执行一次
 ```
 
-### 3.3 录制超时自动释放
+### 3.4 过期槽位清理逻辑
+
+**核心方法**：[cleanupStaleBrowserSlots](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L702-L729)
+
+```typescript
+public cleanupStaleBrowserSlots = (): void => {
+  const now = Date.now();
+  const staleThreshold = 5 * 60 * 1000; // 5分钟
+  
+  for (const [id, info] of Object.entries(this.pool)) {
+    // 注意：检查 "initializing" 状态，但实际这个状态从未被设置
+    const isStale = info.status === "reserved" || info.status === "initializing";
+    const age = now - (info.createdAt || 0);
+    
+    if (isStale && info.browser === null && age > staleThreshold) {
+      this.failBrowserSlot(id, `Slot stale for ${age/1000}s`);
+    }
+  }
+  
+  // 同时清理过期的预约锁（超过1分钟）
+  for (const [lockKey, timestamp] of this.reservationLocks.entries()) {
+    if (now - timestamp > 60000) {
+      this.reservationLocks.delete(lockKey);
+    }
+  }
+};
+```
+
+### 3.5 录制超时自动释放
 
 **核心文件**：[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/controller.ts#L14-L15)
 
@@ -341,7 +423,7 @@ const RECORDING_TIMEOUT_MS = 10 * 60 * 1000; // 10分钟
 const recordingTimeouts = new Map<string, NodeJS.Timeout>();
 ```
 
-录制浏览器在创建时设置 10 分钟超时，超时后自动销毁：
+录制浏览器在创建时设置 10 分钟超时：
 
 ```typescript
 const timeoutHandle = setTimeout(async () => {
@@ -352,43 +434,59 @@ const timeoutHandle = setTimeout(async () => {
 }, RECORDING_TIMEOUT_MS);
 ```
 
-### 3.4 过期槽位清理
+### 3.6 服务优雅关闭时的资源释放
 
-**核心方法**：[cleanupStaleBrowserSlots](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts#L702-L729)
+**核心代码**：[server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/server.ts#L213-L260)
 
-防止浏览器初始化失败或卡住导致的资源泄漏：
+SIGINT 信号处理流程：
+1. 遍历所有运行中的浏览器
+2. 如有采集数据，保存到对应的 Run 记录
+3. 逐个调用 `destroyRemoteBrowser`
+4. 依次停止：scheduleWorker → workers → graphileWorkerUtils
+5. 关闭服务器
 
-- **清理阈值**：5 分钟（`staleThreshold = 5 * 60 * 1000`）
-- **清理条件**：状态为 `reserved` 或 `initializing`，且 `browser === null`
-- **同时清理**：过期的预约锁（超过 1 分钟）
-
-### 3.5 解释器状态清理
+### 3.7 解释器状态清理
 
 当运行中止或失败时，解释器需要清理状态：
 
 ```typescript
-await browser.interpreter.clearState();
+try { 
+  if (browser && browser.interpreter) {
+    await browser.interpreter.clearState(); 
+  } 
+} catch (_) {}
+await destroyRemoteBrowser(browserId, data.userId);
 ```
 
 ---
 
 ## 四、各层配合关系
 
-### 4.1 完整任务执行链路
+### 4.1 完整任务执行链路（两种路径）
+
+#### 路径 A：有可用浏览器槽位
 
 ```
 用户请求 / 定时调度
       ↓
-  任务入队 (Graphile Worker)
+  检查浏览器槽位 → 可用
       ↓
-  Worker 池消费 (TOTAL_CONCURRENCY)
+  预约槽位 (reserved)
       ↓
-  创建浏览器槽位 (BrowserPool)
-      ↓  [资源限额: 1用户-2浏览器]
-  浏览器初始化 (异步)
+  异步启动浏览器初始化
+      ↓
+  创建 Run 记录 (status: 'running')
+      ↓
+  加入 Graphile Worker 队列 (EXECUTE_RUN)
+      ↓
+  Worker 池消费 (TOTAL_CONCURRENCY 限制)
+      ↓
+  Worker 轮询等待浏览器就绪 (最多 45s)
+      ↓
+  浏览器初始化完成 (status: 'ready')
       ↓
   工作流执行 (Interpreter)
-      ↓  [内部并发: maxConcurrency]
+      ↓  [内部并发: maxConcurrency = 5]
   任务完成 / 失败
       ↓
   销毁浏览器，释放资源
@@ -396,25 +494,61 @@ await browser.interpreter.clearState();
   Worker 释放，可消费下一个任务
 ```
 
-### 4.2 并发层级汇总
+#### 路径 B：无可用浏览器槽位
+
+```
+用户请求 / 定时调度
+      ↓
+  检查浏览器槽位 → 不可用
+      ↓
+  创建 Run 记录 (status: 'queued')
+      ↓
+  返回 queued: true 给用户
+      ↓
+  [每 5 秒 processQueuedRuns 轮询]
+      ↓
+  槽位释放后，重复路径 A
+```
+
+### 4.2 排队状态流转
+
+```
+用户请求
+    ↓
+hasAvailableBrowserSlots?
+    ├─ 是 → reserved → running → (Worker 执行) → success/failed
+    └─ 否 → queued → [等待 5s 轮询] → [有槽位] → running → ...
+                ↓
+              用户中止 → aborting → aborted
+```
+
+### 4.3 并发层级汇总
 
 | 层级 | 控制对象 | 限额配置 | 默认值 | 所在文件 |
 |------|----------|----------|--------|----------|
 | 全局任务 | Worker 并发数 | `WORKER_CONCURRENCY` | 10 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L80) |
 | 用户级 | 浏览器实例数 | 硬编码策略 | 2/用户 | [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts) |
 | 用户级 | 录制浏览器数 | 硬编码策略 | 1/用户 | [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts) |
+| 应用层 | 排队任务数 | 无限制（数据库存储） | 无限制 | - |
 | 工作流内 | 内部任务并发 | `maxConcurrency` | 5 | [interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/maxun-core/src/interpret.ts#L102) |
 | 数据库连接 | Worker 池大小 | `TOTAL_CONCURRENCY + 2` | 12 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L692) |
 | 数据库连接 | Utils 池大小 | 硬编码 | 3 | [graphileWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/storage/graphileWorker.ts#L28) |
 
-### 4.3 关键交互点
+### 4.4 关键交互点
 
-#### 4.3.1 任务队列与浏览器池的交互
+#### 4.4.1 应用层排队与 Worker 队列的交互
 
-- **创建运行时**：在 `createWorkflowAndStoreMetadata` 中调用 `createRemoteBrowserForRun` 预约浏览器槽位，然后将任务加入队列
-- **任务执行时**：Worker 从队列取出任务，等待浏览器就绪（轮询检查槽位状态），然后执行工作流
+- **用户请求时**：先检查浏览器槽位，决定走直接入队还是应用层排队
+- **排队恢复时**：`processQueuedRuns` 每 5 秒检查一次，有槽位则创建浏览器并入队
+- **崩溃恢复时**：`recoverOrphanedRuns` 将无浏览器的运行重新标记为 `queued`
 
-#### 4.3.2 浏览器池与解释器的交互
+#### 4.4.2 任务队列与浏览器池的交互
+
+- **创建运行时**：调用 `createRemoteBrowserForRun` 预约浏览器槽位，然后将任务加入队列
+- **任务执行时**：Worker 从队列取出任务，轮询等待浏览器就绪（检查 status 和 browser 对象）
+- **超时时**：浏览器初始化超过 45 秒未就绪，抛出错误并释放资源
+
+#### 4.4.3 浏览器池与解释器的交互
 
 - 每个浏览器实例（`RemoteBrowser`）包含一个解释器（`Interpreter`）
 - 解释器内部的并发控制独立于全局并发控制
@@ -422,31 +556,25 @@ await browser.interpreter.clearState();
 
 ---
 
-## 五、关键代码路径索引
+## 五、代码缺陷与改进建议
 
-### 5.1 任务排队路径
+### 5.1 已发现的代码缺陷
 
-| 操作 | 入口文件 | 核心函数/方法 |
-|------|----------|--------------|
-| 定时任务入队 | [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/schedule-worker.ts) | `processDueSchedules` → `claimDueDbSchedules` → `addJob` |
-| 手动运行入队 | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts) | API 端点 → `addJob(QUEUE_NAMES.EXECUTE_RUN)` |
-| 调度器入队 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts) | `createWorkflowAndStoreMetadata` → `addJob` |
+**缺陷 1：`initializing` 状态从未被设置**
 
-### 5.2 并发控制路径
+- **位置**：[BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts)
+- **问题**：类型定义包含 `"initializing"` 状态，但代码中从未实际设置
+- **影响**：`cleanupStaleBrowserSlots` 中检查 `status === "initializing"` 的逻辑永远不会触发
+- **建议**：要么在 `initializeBrowserAsync` 开始时设置 `status = "initializing"`，要么从类型定义和清理逻辑中移除该状态
 
-| 层级 | 文件 | 关键代码 |
-|------|------|----------|
-| 全局 Worker | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts) | `TOTAL_CONCURRENCY` 变量、`startWorkers` 函数 |
-| 浏览器池 | [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts) | `reserveBrowserSlotAtomic`、`hasAvailableBrowserSlots` |
-| 工作流内部 | [concurrency.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/maxun-core/src/utils/concurrency.ts) | `addJob`、`runNextJob` |
+**缺陷 2：浏览器初始化异步进行，但状态不更新**
 
-### 5.3 资源释放路径
+- **问题**：`reserveBrowserSlotAtomic` 设置 `status = "reserved"` 后，调用 `initializeBrowserAsync` 异步初始化
+- **影响**：在初始化过程中，状态一直是 `reserved`，无法区分"已预约未开始初始化"和"正在初始化中"
+- **建议**：在 `initializeBrowserAsync` 开始时将状态更新为 `"initializing"`
 
-| 触发场景 | 文件 | 关键函数 |
-|----------|------|----------|
-| 正常完成 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts) | `processRunExecution` 末尾 → `destroyRemoteBrowser` |
-| 执行失败 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts) | catch 块 → `destroyRemoteBrowser` |
-| 用户中止 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts) | `abortRun` → `destroyRemoteBrowser` |
-| 录制超时 | [controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/controller.ts) | `setTimeout` 回调 → `destroyRemoteBrowser` |
-| 槽位过期 | [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/classes/BrowserPool.ts) | `cleanupStaleBrowserSlots` → `failBrowserSlot` |
-| 浏览器创建失败 | [controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/controller.ts) | `initializeBrowserAsync` catch 块 → `browserPool.failBrowserSlot` |
+### 5.2 潜在风险
+
+1. **排队任务无超时**：`queued` 状态的任务没有超时机制，可能永远排队
+2. **重试次数硬编码**：崩溃恢复的重试次数（3次）硬编码在代码中
+3. **用户级资源隔离不足**：一个用户占满 2 个浏览器槽位后，其他任务只能排队，没有优先级机制
