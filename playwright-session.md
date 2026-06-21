@@ -307,9 +307,195 @@ if (isStale && info.browser === null && age > staleThreshold) { ... }
 
 ---
 
-## 三、会话释放
+## 三、失败清理路径深度分析
 
-### 3.1 switchOff — 单个浏览器关闭
+### 3.1 核心纠错：`failed` 状态从未写入池中
+
+`BrowserPoolInfo` 接口虽然定义了 `status?: "reserved" | "initializing" | "ready" | "failed"`，但：
+
+1. **`"failed"` 从未被赋值** — [failBrowserSlot()](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/classes/BrowserPool.ts#L677-L696) 的实现是**直接删除池条目**，而非先设置 `status = "failed"` 再保留
+2. **`getRemoteBrowser()` 有检查但永远命中不到** — [getRemoteBrowser()](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/classes/BrowserPool.ts#L238-L242) 中 `if (poolInfo.status === "failed")` 的分支在当前代码逻辑下永远不会执行
+3. **只有日志意义** — `logger.log('info', \`Marking browser slot ${id} as failed\`)` 只是日志，不对应实际的池状态变更
+
+```ts
+// failBrowserSlot 的真实行为（非：先设 failed 再删）
+public failBrowserSlot = (id: string): void => {
+    if (this.pool[id]) {
+        logger.log('info', `Marking browser slot ${id} as failed`);  // 仅日志
+        if (browserInfo.browser) {
+            browserInfo.browser.switchOff?.().catch(...);  // 尝试关浏览器
+        }
+        this.deleteRemoteBrowser(id);  // 直接删除，不设 status = "failed"
+    }
+};
+```
+
+**结论**：`"failed"` 是接口中定义、`getRemoteBrowser` 中检查、但实际运行时池里永远不会出现的"幽灵状态"。它可能是设计预留但未实现的功能。
+
+---
+
+### 3.2 五种失败场景的清理路径对比
+
+| 失败场景 | 触发位置 | 清理方法 | 是否调用 `failBrowserSlot` | 是否清理 Socket 命名空间 | 池是否会残留条目 |
+|---------|---------|---------|--------------------------|------------------------|----------------|
+| 录制会话初始化失败 | [controller.ts#L72-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L72-L99) | 直接 `browserSession.switchOff()` | ❌ 否 | ❌ **否（命名空间泄漏）** | ❌ 无残留（从未入池） |
+| 录制会话入池失败 | [controller.ts#L48-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L48-L56) | 直接 `browserSession.switchOff()` | ❌ 否 | ❌ **否（命名空间泄漏）** | ❌ 无残留（入池被拒） |
+| Run 会话初始化失败 | [controller.ts#L429-L438](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L429-L438) | `browserPool.failBrowserSlot(id)` | ✅ 是 | ❌ **否（命名空间泄漏）** | ❌ 无残留（fail 即删） |
+| 校验会话入池失败 | [controller.ts#L519-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L519-L523) | 直接 `browserSession.switchOff()` | ❌ 否 | ❌ 否（校验用 dummy，无真实命名空间） | ❌ 无残留（入池被拒） |
+| 校验会话拿不到 Page | [controller.ts#L525-L529](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L525-L529) | `destroyRemoteBrowser(id, userId)` | ❌ 否 | ✅ 是（完整销毁） | ❌ 无残留（完整销毁） |
+
+---
+
+### 3.3 逐场景详细分析
+
+#### 场景 1：录制会话初始化失败
+
+**触发条件**：`browserSession.initialize(userId)` 抛出异常（如连不上浏览器服务、Context 创建超时等）。
+
+**清理流程**：
+
+```
+try {
+    await browserSession.initialize(userId);  // ← 这里抛异常
+    await browserSession.registerEditorEvents();
+    browserPool.addRemoteBrowser(...);         // ← 不会执行到
+} catch (initError) {
+    socket.emit('dom-mode-error', ...);        // 1. 通知前端
+    socket.emit('error', { message, details }); // 2. 发送错误详情
+    await new Promise(r => setTimeout(r, 100)); // 3. 等 100ms
+    await browserSession.switchOff();          // 4. 关闭浏览器
+    return id;                                 // 5. 直接返回
+}
+```
+
+**关键观察**：
+- 浏览器**从未入池** — 因为 `addRemoteBrowser` 在 try 块的后部，初始化失败不会执行到那里
+- **Socket 命名空间泄漏** — `createSocketConnection(io.of(id), ...)` 已经创建了命名空间（`io.of(id)` 是惰性创建，调用即存在），但失败时没有清理它。命名空间会一直保留在 Socket.IO 的 `_nsps` Map 中
+- 没有调用 `failBrowserSlot` — 因为 Recording 会话不走预留/升级流程，失败时直接手动清理
+
+---
+
+#### 场景 2：录制会话入池失败
+
+**触发条件**：`browserPool.addRemoteBrowser()` 返回 `false`（用户已有 recording 浏览器，或已达 2 个浏览器上限）。
+
+**清理流程**：
+
+```
+const added = browserPool.addRemoteBrowser(id, browserSession, userId, false, "recording");
+if (!added) {
+    socket.emit('dom-mode-error', ...);       // 1. 通知前端
+    await browserSession.switchOff();         // 2. 关闭浏览器
+    return id;                                // 3. 直接返回
+}
+```
+
+**关键观察**：
+- 浏览器已经初始化完成，但入池被拒（并发/配额问题）
+- 同样**没有清理 Socket 命名空间**
+- 同样**不走 `failBrowserSlot`**
+- 与"初始化失败"的区别：浏览器已经完整启动了，只是因为配额原因无法入池
+
+---
+
+#### 场景 3：Run 会话初始化失败
+
+**触发条件**：`initializeBrowserAsync()` 中任何异常（命名空间错误、Socket 连接失败、浏览器初始化失败、升级失败等）。
+
+**清理流程**（共 3 处异常出口，全部走 `failBrowserSlot`）：
+
+```
+① 命名空间 error 事件 → browserPool.failBrowserSlot(id)
+② 浏览器初始化失败 catch → browserPool.failBrowserSlot(id)
+③ 外层 try/catch 兜底 → browserPool.failBrowserSlot(id)
+```
+
+`failBrowserSlot` 内部做的事：
+1. 打日志 `"Marking browser slot ${id} as failed"`
+2. 如果 `browserInfo.browser` 存在，调用 `switchOff()`（**异步 fire-and-forget**，不等待）
+3. `deleteRemoteBrowser(id)` — 从池中删除条目
+
+**关键观察**：
+- Run 会话**唯一**通过 `failBrowserSlot` 清理的路径
+- `switchOff()` 是 `.catch(...)` 的 fire-and-forget 调用，**不等待关闭完成**就删除池条目
+- **Socket 命名空间同样泄漏** — `failBrowserSlot` 只处理浏览器和池，不管命名空间
+- 失败后池里**没有 failed 状态的条目** — 直接删了
+
+---
+
+#### 场景 4：校验会话入池失败
+
+**触发条件**：`browserPool.addRemoteBrowser()` 返回 `false`（用户已达 2 个浏览器上限）。
+
+**清理流程**：
+
+```
+const added = browserPool.addRemoteBrowser(id, browserSession, userId, true, 'run');
+if (!added) {
+    await browserSession.switchOff();        // 1. 关闭浏览器
+    throw new Error('Failed to add validation browser to pool'); // 2. 抛错
+}
+```
+
+**关键观察**：
+- 与录制入池失败类似，直接 `switchOff()`，不走 `failBrowserSlot`
+- 校验会话用 dummy socket，没有真实的前端命名空间，不存在命名空间泄漏问题
+
+---
+
+#### 场景 5：校验会话拿不到 Page
+
+**触发条件**：浏览器成功入池，但 `browserSession.getCurrentPage()` 返回 null/undefined。
+
+**清理流程**：
+
+```
+const page = browserSession.getCurrentPage();
+if (!page) {
+    await destroyRemoteBrowser(id, userId);  // 走完整销毁流程
+    throw new Error('Failed to get page from validation browser');
+}
+```
+
+**关键观察**：
+- **唯一走 `destroyRemoteBrowser()` 的失败路径** — 因为浏览器已经成功入池了，需要完整清理
+- 会清理 Socket 命名空间（虽然是 dummy 的）
+- 会从池中删除条目
+
+---
+
+### 3.4 失败清理的共性问题
+
+#### ① 命名空间泄漏（Recording / Run 场景）
+
+Recording 和 Run 会话在初始化失败时，Socket.IO 的动态命名空间（`io.of(id)`）已经创建但**从未被清理**。命名空间会一直存在于 `io._nsps` Map 中，虽然空的命名空间资源消耗不大，但属于资源泄漏。
+
+只有正常销毁路径（`destroyRemoteBrowser`）才会清理命名空间。
+
+#### ② `failBrowserSlot` 与直接 `switchOff` 的差异
+
+| 维度 | `failBrowserSlot(id)` | 直接 `browserSession.switchOff()` |
+|------|----------------------|----------------------------------|
+| 调用者 | Run 会话初始化失败 | Recording 初始化/入池失败、Validation 入池失败 |
+| 浏览器关闭方式 | `switchOff?.().catch(...)` — fire-and-forget，不等待 | `await switchOff()` — 同步等待 |
+| 是否删池条目 | ✅ 是 | ❌ 否（因为从未入池） |
+| 是否清理命名空间 | ❌ 否 | ❌ 否 |
+| 适用场景 | 浏览器已在池中（reserved 状态），需要清池 | 浏览器还没入池，只需要关浏览器 |
+
+#### ③ `failed` 状态的设计与实现不一致
+
+- **接口层**：定义了 `"failed"` 状态值
+- **读取层**：`getRemoteBrowser()` 检查了 `"failed"` 并返回 undefined
+- **写入层**：没有任何代码将 `status` 设为 `"failed"`
+- **清理层**：`failBrowserSlot()` 直接删除，不留存失败状态
+
+这意味着 `"failed"` 状态是一个**设计了但未落地**的状态，可能是为未来扩展（如失败重试、失败统计）预留的。
+
+---
+
+## 四、会话释放
+
+### 4.1 switchOff — 单个浏览器关闭
 
 文件：[RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L736-L839)
 
@@ -329,7 +515,7 @@ if (isStale && info.browser === null && age > staleThreshold) { ... }
 
 每步均在 `try/catch/finally` 中执行，即使某步失败也会继续清理后续资源，最终将所有引用置为 `null`。
 
-### 3.2 destroyRemoteBrowser — 完整销毁流程
+### 4.2 destroyRemoteBrowser — 完整销毁流程
 
 文件：[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L155-L233)
 
@@ -344,7 +530,7 @@ if (isStale && info.browser === null && age > staleThreshold) { ... }
 
 整体 30s 超时保护；超时后强制从池中删除。
 
-### 3.3 Recording 超时自动清理
+### 4.3 Recording 超时自动清理
 
 文件：[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L58-L71)
 
@@ -358,18 +544,18 @@ const timeoutHandle = setTimeout(async () => {
 }, RECORDING_TIMEOUT_MS);
 ```
 
-### 3.4 BrowserPool 清理方法
+### 4.4 BrowserPool 清理方法
 
 | 方法 | 场景 |
 |------|------|
 | `closeAndDeleteBrowser()` | 从池中移除并删除映射（不关闭浏览器本身） |
 | `deleteRemoteBrowser()` | 仅从池中移除，不尝试关闭 |
-| `failBrowserSlot()` | 标记失败 → 调用 `switchOff()` → 删除 |
-| `cleanupStaleBrowserSlots()` | 清理超过 5 分钟的 reserved/initializing 槽位 |
+| `failBrowserSlot()` | 尝试 `switchOff()` → 删除（不写入 failed 状态） |
+| `cleanupStaleBrowserSlots()` | 清理超过 5 分钟的 reserved 槽位（仅 Run 会话有效） |
 
 ---
 
-## 四、三种会话类型对比
+## 五、三种会话类型对比
 
 | 维度 | Recording 会话 | Run 会话 | Validation 会话 |
 |------|---------------|----------|-----------------|
@@ -384,7 +570,7 @@ const timeoutHandle = setTimeout(async () => {
 
 ---
 
-## 五、Socket 通信与会话的绑定
+## 六、Socket 通信与会话的绑定
 
 文件：[connection.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/socket-connection/connection.ts)
 
@@ -405,7 +591,7 @@ const timeoutHandle = setTimeout(async () => {
 
 ---
 
-## 六、关键对象关系图
+## 七、关键对象关系图
 
 ```
 BrowserPool
@@ -437,7 +623,7 @@ RemoteBrowser
 
 ---
 
-## 七、资源释放保障机制
+## 八、资源释放保障机制
 
 1. **逐步释放 + 超时**：`switchOff()` 每步 5s 超时，`destroyRemoteBrowser()` 整体 30s 超时
 2. **异常不中断**：每步在 try/catch/finally 中执行，单步失败不影响后续清理
