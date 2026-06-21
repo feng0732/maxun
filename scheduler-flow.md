@@ -1,363 +1,417 @@
-# 调度器流程分析：Cron 任务 vs 一次性任务
+# 调度器完整链路分析：Cron / 手动 / SDK / MCP / CLI 五路分流
 
-## 一、整体架构概览
+---
 
-调度系统采用 **DB 轮询 + Graphile Worker 任务队列** 的混合架构，核心分层如下：
+## 一、统一链路全景图
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                        API 路由层                              │
-│  storage.ts (PUT /runs/:id, PUT /schedule/:id/, POST /abort) │
-└────────────────────┬──────────────────────────────────────────┘
-                     │
-        ┌────────────┴────────────┐
-        ▼                         ▼
-┌───────────────┐        ┌──────────────────┐
-│ 一次性任务入口 │        │  Cron 配置入口    │
-│ create Run +  │        │ scheduleWorkflow │
-│ addJob()      │        │ 写 Robot.schedule │
-└───────┬───────┘        └────────┬─────────┘
-        │                         │
-        ▼                         ▼
-┌─────────────────────────────────────────────┐
-│         Graphile Worker (PostgreSQL 队列)    │
-│  ┌───────────────────────────────────────┐  │
-│  │ QUEUE_NAMES                           │  │
-│  │ · EXECUTE_RUN      ← 一次性/文档任务   │  │
-│  │ · SCHEDULED_WORKFLOW ← Cron 触发任务   │  │
-│  │ · ABORT_RUN        ← 中止任务         │  │
-│  │ · INITIALIZE_BROWSER_RECORDING        │  │
-│  │ · DESTROY_BROWSER                     │  │
-│  │ · INTERPRET_WORKFLOW                  │  │
-│  │ · STOP_INTERPRETATION                 │  │
-│  └───────────────────────────────────────┘  │
-└──────────────────┬──────────────────────────┘
-                   │
-        ┌──────────┴───────────┐
-        ▼                      ▼
-┌───────────────┐      ┌─────────────────────┐
-│ processRunEx… │      │ handleRunRecording  │
-│ (task-runner) │      │ (scheduler/index)   │
-│ 执行工作流     │      │ 创建Run+浏览器+执行 │
-└───────┬───────┘      └─────────┬───────────┘
-        │                        │
-        ▼                        ▼
-┌─────────────────────────────────────────────┐
-│              Run 状态机 + 通知               │
-│  scheduled → queued → running → success/    │
-│                        failed/aborted       │
-│  + Socket.io 实时通知 + Webhook 回调         │
-└─────────────────────────────────────────────┘
+                               ┌──────────────────────────────────────────────────────────┐
+                               │                      触发源 (5 路)                         │
+                               └────────────┬───────────────────────┬───────────────────────┘
+                                            │                       │
+                ┌───────────────────────────┘                       └──────────────────┐
+                │                                                                        │
+     ┌──────────▼──────────┐                                             ┌──────────────▼──────────────┐
+     │ ① Cron 定时调度器    │                                             │ ②~⑤ 外部调用（一次性任务）    │
+     │ schedule-worker.ts   │                                             │ API / SDK / CLI / MCP / 前端  │
+     └──────────┬──────────┘                                             └──────────────┬──────────────┘
+                │                                                                       │
+                ▼                                                                       ▼
+  addJob(SCHEDULED_WORKFLOW,                                                   ┌────────┴─────────┐
+         {maxAttempts:6})                                                      │                  │
+                │                                                    ┌───────▼──────┐    ┌──────▼──────────┐
+                ▼                                                    │ 前端手动触发  │    │ API / SDK /    │
+ ┌──────────────────────────────┐                                     │ routes/       │    │ CLI / MCP       │
+ │ task-runner.ts               │                                     │ storage.ts     │    │ (api/*.ts)       │
+ │ SCHEDULED_WORKFLOW 处理器    │                                     │ PUT /runs/:id │    └──────┬──────────┘
+ │ → scheduler/index.ts         │                                     └───────┬──────┘           │
+ │   handleRunRecording()       │                                             │                  │
+ └──────────────┬───────────────┘                                             │                  │
+                │                                                             ▼                  ▼
+                │                                                addJob(EXECUTE_RUN,       handleRunRecording()
+                │                                                {maxAttempts:1})        api/record.ts#L1403
+                │                                                             │                  │
+                │                                                             │   ┌──────────────┘
+                │                                                             │   │
+                │                                                             ▼   ▼
+                │                                              ┌──────────────────────────────┐
+                │                                              │  Graphile Worker 队列层       │
+                │                                              │  · QUEUE: EXECUTE_RUN         │
+                │                                              │  · QUEUE: SCHEDULED_WORKFLOW  │
+                │                                              └──────────────┬───────────────┘
+                │                                                             │
+                │                                                             ▼
+                │                                              ┌──────────────────────────────┐
+                │                                              │ task-runner.ts                │
+                │                                              │ EXECUTE_RUN 处理器            │
+                │                                              │ → processRunExecution()      │
+                │                                              └──────────────┬───────────────┘
+                │                                                             │
+                └──────────────────────┬──────────────────────────────────────┘
+                                       ▼
+                       ┌──────────────────────────────────────┐
+                       │           执行 + 状态更新              │
+                       │  scheduled/queued → running →        │
+                       │  success / failed / aborting /       │
+                       │  aborted                              │
+                       └──────────────┬───────────────────────┘
+                                      ▼
+                       ┌──────────────────────────────────────┐
+                       │        通知 & 后处理                   │
+                       │  Socket.io → 前端                      │
+                       │  Webhook → 外部系统                    │
+                       │  Integration → GoogleSheet / Airtable │
+                       └──────────────────────────────────────┘
 ```
 
 ---
 
-## 二、Cron 定时任务完整流程
+## 二、五路触发源详解（含代码定位）
 
-### 2.1 Cron 配置写入
+### 2.1 触发源总览表
 
-**入口**：[storage.ts#L1225-L1342](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1225-L1342) `PUT /schedule/:id/`
+| # | 触发方式 | 入口文件与函数 | Run 标记字段 | 入队队列 | 初始状态 |
+|---|---------|--------------|-------------|---------|---------|
+| ① | **Cron 定时** | [schedule-worker.ts#L156-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L156-L177) `processDueSchedules()` | `runByScheduleId` | `SCHEDULED_WORKFLOW` | `scheduled` |
+| ② | **前端手动** | [routes/storage.ts#L997-L1131](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L997-L1131) `PUT /runs/:id` | - | `EXECUTE_RUN` | `running` / `queued` |
+| ③ | **REST API** | [api/record.ts#L1589-L1620](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L1589-L1620) `POST /api/robots/:id/runs` | `runByAPI: true` | **不直接入队** | `running` |
+| ④ | **SDK / CLI** | [api/sdk.ts#L682-L801](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/sdk.ts#L682-L801) `POST /api/sdk/robots/:id/execute` | `runBySDK: true` / `runByCLI: true` | **不直接入队** | `running` |
+| ⑤ | **MCP Worker** | [mcp-worker.ts#L113-L182](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/mcp-worker.ts#L113-L182) `run_robot` 工具 → 内部调用 `POST /api/robots/:id/runs` 带 `x-run-source: mcp` | `runByMCP: true` | **不直接入队** | `running` |
 
-用户通过 API 设置调度规则，流程如下：
+> **关键分流点**：③~⑤ 虽然是不同入口，但最终都汇入 [api/record.ts#L1403-L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L1403-L1458) 的 `handleRunRecording()`；而 ① Cron 走的是 [scheduler/index.ts#L860-L909](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L860-L909) 的 **同名但不同文件** 的 `handleRunRecording()`；② 前端手动不走任何 `handleRunRecording`，直接入队 `EXECUTE_RUN`。
 
-1. 接收参数：`runEvery`、`runEveryUnit`（分钟/小时/天/周/月）、`startFrom`、`atTimeStart`、`atTimeEnd`、`timezone`
-2. 构建 cron 表达式（使用 `node-cron.validate` 验证）：
-   - 每分钟：`*/N * * * *`
-   - 每小时：`M */N * * *`
-   - 每天：`M H */N * *`
-   - 每周：`M H * * DOW`
-   - 每月：`M H DOM */N * [DOW]`
-3. 调用 [storage/schedule.ts#L5-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/storage/schedule.ts#L5-L28) `scheduleWorkflow()`：
-   - 使用 [utils/schedule.ts#L4-L12](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/utils/schedule.ts#L4-L12) `computeNextRun(cronExpression, timezone)` 计算下次运行时间（基于 `cron-parser`）
-   - 更新 `Robot.schedule` JSONB 字段：
-     ```ts
-     schedule: {
-       cronExpression,
-       timezone,
-       nextRunAt,        // 下次触发时间（Date）
-       schedulerClaimedAt: undefined,
-       // ... 其他配置字段
-     }
-     ```
+---
 
-### 2.2 DB 轮询与认领
+### 2.2 触发源 ①：Cron 定时调度（schedule-worker）
 
-**入口**：[schedule-worker.ts#L156-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L156-L177) `startScheduleWorker()`
-
-服务启动时启动定时器，每 `30000ms`（30秒）轮询一次：
-
-```
-startScheduleWorker()
-  └─ setInterval(processDueSchedules, 30000)
-       └─ claimDueDbSchedules()  // 核心认领逻辑
-```
-
-**认领逻辑** [schedule-worker.ts#L29-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L29-L85)：
-
-采用 **PostgreSQL 咨询锁 + 行级锁（SKIP LOCKED）** 保证分布式安全：
-
-1. 事务内获取咨询锁：`pg_try_advisory_xact_lock(43821742)`
-2. 查询符合条件的 Robot：
-   - `schedule.cronExpression IS NOT NULL`（配置了 cron）
-   - `schedule.nextRunAt <= NOW()`（已到触发时间）
-   - `schedule.schedulerClaimedAt IS NULL OR < 10分钟前`（未被认领或认领已超时）
-3. `SELECT ... FOR UPDATE SKIP LOCKED` 跳过已被锁定的行
-4. 对每个满足条件的 Robot，设置 `schedulerClaimedAt = NOW()` 标记为已认领
-5. 按 `nextRunAt ASC` 排序，最多处理 `BATCH_SIZE = 10` 条
-
-### 2.3 入队 SCHEDULED_WORKFLOW
-
-**调度分发** [schedule-worker.ts#L122-L154](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L122-L154) `processDueSchedules()`：
+**步骤 1：服务启动时注册轮询** [schedule-worker.ts#L156-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L156-L177)
 
 ```ts
-for each claimed robot:
-  executedAt = NOW()
-  dispatched = false
-  try:
-    addJob(QUEUE_NAMES.SCHEDULED_WORKFLOW, 
-      { robotMetaId, userId }, 
-      { maxAttempts: 6 }   // 最多重试6次
-    )
-    dispatched = true
-  finally:
-    if dispatched:
-      finalizeSchedule(robotMetaId, executedAt)  // 计算下一次nextRunAt
-    else:
-      releaseScheduleClaim(robotMetaId)           // 释放认领标记
+export function startScheduleWorker() {
+  setInterval(() => processDueSchedules(), 30_000);  // 每 30 秒轮询一次
+  processDueSchedules();  // 启动时立即执行一次
+}
 ```
 
-**finalizeSchedule** [schedule-worker.ts#L87-L108](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L87-L108)：
-- 调用 `computeNextRun()` 计算下一次运行时间
-- 更新 Robot：`schedulerClaimedAt` 清空，`lastRunAt = executedAt`，`nextRunAt = 新时间`
-
-### 2.4 Cron 任务执行
-
-**任务处理器** [task-runner.ts#L670-L674](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L670-L674)：
+**步骤 2：DB 认领（分布式锁）** [schedule-worker.ts#L29-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L29-L85) `claimDueDbSchedules()`
 
 ```ts
-QUEUE_NAMES.SCHEDULED_WORKFLOW → handleRunRecording(robotMetaId, userId)
+// 条件：cronExpression 存在 + nextRunAt <= NOW + 认领未超时（10分钟）
+// 锁：pg_try_advisory_xact_lock(43821742) + SELECT ... FOR UPDATE SKIP LOCKED
+// 标记：schedule.schedulerClaimedAt = NOW()
+// 批量：最多 BATCH_SIZE = 10
 ```
 
-调用链 [workflow-management/scheduler/index.ts#L860-L909](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L860-L909)：
+**步骤 3：入队 SCHEDULED_WORKFLOW** [schedule-worker.ts#L122-L154](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L122-L154) `processDueSchedules()`
 
+```ts
+addJob(QUEUE_NAMES.SCHEDULED_WORKFLOW,
+  { robotMetaId, userId },
+  { maxAttempts: 6 }   // Cron 失败最多重试 6 次
+)
 ```
+
+**步骤 4：finalizeSchedule 计算下次运行** [schedule-worker.ts#L87-L108](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L87-L108)
+
+```ts
+computeNextRun(cronExpression, timezone)  // 基于 cron-parser
+→ 更新 Robot: nextRunAt, lastRunAt, schedulerClaimedAt=NULL
+```
+
+**步骤 5：SCHEDULED_WORKFLOW 任务处理器** [task-runner.ts#L670-L674](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L670-L674)
+
+```ts
+[QUEUE_NAMES.SCHEDULED_WORKFLOW]: (job) =>
+  handleRunRecording(job.payload.robotMetaId, String(job.payload.userId))
+// 调用 scheduler/index.ts 的 handleRunRecording
+```
+
+**步骤 6：Cron 专用 handleRunRecording** [scheduler/index.ts#L860-L909](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L860-L909)
+
+```ts
 handleRunRecording(id, userId)
   ├─ createWorkflowAndStoreMetadata(id, userId)
-  │   ├─ 查询 Robot 记录
-  │   ├─ 创建浏览器实例（doc-robot除外：直接用uuid()）
-  │   ├─ Run.create({ status: 'scheduled', ... })
-  │   ├─ 发送 Socket 'run-scheduled' 通知
-  │   └─ if isDocRobot:
-  │        └─ addJob(QUEUE_NAMES.EXECUTE_RUN, {...}, {maxAttempts: 1})
-  │           → 直接交给通用执行器
+  │   ├─ Robot.findOne()  查询配置
+  │   ├─ browserId = isDocRobot ? uuid() : createRemoteBrowserForRun(userId)
+  │   ├─ Run.create({ status: 'scheduled', ..., runByScheduleId: scheduleId })
+  │   ├─ Socket 'run-scheduled' → /queued-run user-${userId}
+  │   └─ 文档机器人二次入队:
+  │        addJob(EXECUTE_RUN, {...}, {maxAttempts:1})
   │
-  └─ else (非文档机器人):
-       ├─ socket.connect(`/${browserId}`)
-       ├─ 监听 'ready-for-run' 事件
-       └─ readyForRunHandler → executeRun(runId, userId)
+  └─ 非文档机器人:
+       socket.connect(/${browserId})
+       on('ready-for-run') → executeRun(runId, userId)
 ```
-
-**executeRun** [workflow-management/scheduler/index.ts#L186-L832](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L186-L832) 是 Cron 任务的实际执行函数（一次性任务使用 `processRunExecution`），两者逻辑类似，详见下文。
 
 ---
 
-## 三、一次性（手动）任务完整流程
+### 2.3 触发源 ②：前端手动触发（routes/storage.ts）
 
-### 3.1 手动触发入口
-
-**入口**：[storage.ts#L997-L1131](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L997-L1131) `PUT /runs/:id`
+**入口** [routes/storage.ts#L997-L1131](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L997-L1131) `PUT /runs/:id`
 
 核心是 **浏览器槽位检查 + 分支处理**：
 
-```
-PUT /runs/:id
-  │
-  ├─ hasAvailableBrowserSlots(userId, "run")
-  │
-  ├─ [有槽位] → 立即执行路径:
-  │    ├─ createRemoteBrowserForRun(userId) → browserId
-  │    ├─ Run.create({ status: 'running', browserId, ... })
-  │    └─ addJob(QUEUE_NAMES.EXECUTE_RUN, 
-  │         { userId, runId, browserId }, 
-  │         { maxAttempts: 1 }
-  │       )
-  │
-  └─ [无槽位] → 排队等待路径:
-       ├─ browserId = uuid()  // 占位用
-       ├─ Run.create({ status: 'queued', 
-       │               log: 'Run queued - waiting for available browser slot',
-       │               ... })
-       └─ 由 processQueuedRuns() 定时器稍后处理
+```ts
+if (hasAvailableBrowserSlots(userId, "run")) {
+  // 路径 A：有浏览器槽位 → 立即执行
+  browserId = createRemoteBrowserForRun(userId)
+  Run.create({ status: 'running', browserId, ... })
+  addJob(QUEUE_NAMES.EXECUTE_RUN,             // 直接入队 EXECUTE_RUN
+    { userId, runId, browserId },
+    { maxAttempts: 1 }                         // 不重试
+  )
+} else {
+  // 路径 B：无槽位 → 排队
+  browserId = uuid()  // 占位 ID
+  Run.create({ status: 'queued',
+               log: 'Run queued - waiting for available browser slot', ... })
+  // 不入队，由 processQueuedRuns() 定时轮询处理
+}
 ```
 
-### 3.2 排队任务处理
+**排队任务后续处理** [routes/storage.ts#L1493-L1566](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1493-L1566) `processQueuedRuns()`
 
-**入口**：[storage.ts#L1493-L1566](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1493-L1566) `processQueuedRuns()`
-
-服务启动时通过 `setInterval` 定时调用（由 server.ts 注册）：
-
-```
-processQueuedRuns()
-  ├─ 熔断器检查：连续3次错误 → 冷却30秒
-  ├─ Run.findOne({ status: 'queued' }, ORDER BY startedAt ASC)
-  │
-  └─ 再次检查 hasAvailableBrowserSlots
-       ├─ [有槽位]:
-       │    ├─ createRemoteBrowserForRun(userId)
-       │    ├─ Run.update({ status: 'running', browserId, ... })
-       │    └─ addJob(QUEUE_NAMES.EXECUTE_RUN, {...})
-       │
-       └─ [仍无槽位]: 跳过，下次轮询再试
-```
-
-### 3.3 通用执行器 processRunExecution
-
-**入口**：[task-runner.ts#L130-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L130-L582)，由 `QUEUE_NAMES.EXECUTE_RUN` 触发
-
-这是 **一次性任务、文档机器人、Cron文档任务** 的共享执行路径。完整流程：
-
-#### Step 1: 前置检查 (L136-L179)
-```
-- 查询 Run 记录
-- 检查 status:
-  · 'aborted' | 'aborting' → 跳过
-  · 'queued' → 跳过（由恢复机制处理）
-- 判断机器人类型:
-  · doc-extract → import(executeDocumentRun) 执行文档抽取
-  · doc-parse   → import(executeDocumentParseRun) 执行文档解析
-```
-
-#### Step 2: 浏览器等待 (L181-L213)
-```
-- browserPool.getRemoteBrowser(browserId)
-- 轮询等待，最多 60秒 (BROWSER_INIT_TIMEOUT)
-- 浏览器状态检查:
-  · null → 浏览器槽位不存在，报错
-  · 'failed' → 浏览器初始化失败，报错
-```
-
-#### Step 3: Page 等待 (L217-L237)
-```
-- browser.getCurrentPage()
-- 轮询等待，最多 15秒 (BROWSER_PAGE_TIMEOUT)
-```
-
-#### Step 4: 按机器人类型分支执行
-
-**分支 A: scrape 类型** (L239-L379)
-```
-- 从 interpreterSettings 或 Robot 配置中读取 formats
-- Run.update({ status: 'running' })
-- 发送 Socket 'run-started' 通知
-- 按顺序执行 format 转换（每个带120秒超时）:
-  · screenshot-visible / screenshot-fullpage
-  · text / markdown / html / links
-  · summary（基于markdown → LLM）
-  · promptInstructions（BrowserAgent LLM智能查询）
-- Run.update({ status: 'success/failed', serializableOutput, binaryOutput })
-- 二进制文件上传 MinIO (BinaryOutputService)
-- 发送 Socket 'run-completed' + Webhook
-- destroyRemoteBrowser()
-```
-
-**分支 B: 工作流类型（extract/crawl/search）** (L381-L555)
-```
-- Run.update({ status: 'running' })
-- 发送 Socket 'run-started' 通知
-- browser.interpreter.setRunId(runId) → 实时数据持久化
-- InterpretRecording() → 600秒超时 (10分钟)
-- 期间检查 isRunAborted() → 如果被用户中止则直接返回
-- crawl/search 类型后处理:
-  · processRobotOutputFormats() → 格式转换 + LLM摘要
-  · hasExpectedRobotOutput() → 输出验证
-- Run.update({ status: 'success', serializableOutput + binaryOutput })
-- 二进制上传 + Socket + Webhook + Integration
-- destroyRemoteBrowser()
-```
-
-#### Step 5: 错误兜底 (L512-L581)
-```
-执行异常时:
-  - 检查是否有部分数据已提取 → 触发 Integration 更新
-  - Run.update({ status: 'failed', log })
-  - 发送失败通知 (Socket + Webhook)
-  - 捕获 analytics 事件
-  - 清理浏览器
+```ts
+// 服务启动时 setInterval 注册，定时轮询
+// 熔断器：连续 3 次 DB 错误 → 冷却 30 秒
+Run.findOne({ status: 'queued' }, ORDER BY startedAt ASC)
+  → 再次检查 hasAvailableBrowserSlots
+     → 有槽位: Run.update(status:'running') + addJob(EXECUTE_RUN)
+     → 无槽位: 跳过，下次再试
 ```
 
 ---
 
-## 四、任务状态机与状态流转
+### 2.4 触发源 ③④⑤：API / SDK / CLI / MCP（统一汇入 handleRunRecording）
 
-### 4.1 Run 状态枚举
+#### 2.4.1 各入口的调用关系
 
-定义于 [models/Run.ts#L69-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/models/Run.ts#L69-L72)，实际使用值：
+```
+触发源 ⑤ MCP Worker (mcp-worker.ts#L113-L182 run_robot 工具)
+  │  HTTP POST /api/robots/:id/runs  带 header: x-run-source: 'mcp'
+  ▼
+触发源 ③ REST API (api/record.ts#L1589-L1620 POST /api/robots/:id/runs)
+  │  runSource = headers['x-run-source']==='mcp' ? 'mcp' : 'api'
+  │
+  └──────────────────────┐
+                         ▼
+触发源 ④ SDK/CLI (api/sdk.ts#L682-L801 POST /api/sdk/robots/:id/execute)
+  │  runSource = headers['x-run-source']==='cli' ? 'cli' : 'sdk'
+  │
+  ▼
+统一入口：api/record.ts#L1403-L1458  handleRunRecording(id, userId, runSource)
+  │
+  ├─ runSource 值: 'api' | 'sdk' | 'mcp' | 'cli'
+  │
+  └─ → createWorkflowAndStoreMetadata()  写入对应 runBy* 标记
+```
 
-| 状态 | 含义 | 设置位置 |
-|------|------|----------|
-| `scheduled` | Cron任务已创建Run记录，等待浏览器就绪 | scheduler/index.ts#L78 |
-| `queued` | 浏览器槽位不足，排队等待 | storage.ts#L1104 |
-| `running` | 浏览器就绪，工作流执行中 | processRunExecution L245/L389, scheduler L273 |
-| `success` | 执行成功，结果已保存 | processRunExecution L335/L469, scheduler L436/L658 |
+#### 2.4.2 统一入口：handleRunRecording（api/record.ts 版）
+
+[api/record.ts#L1403-L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L1403-L1458)
+
+```ts
+export async function handleRunRecording(
+  id: string, userId: string,
+  runSource: 'api' | 'sdk' | 'mcp' | 'cli' = 'api',
+  requestedFormats?, promptInstructions?
+) {
+  // Step 1: 创建 Run 记录 + 浏览器
+  const { browserId, runId, isDocRobot } = await createWorkflowAndStoreMetadata(
+    id, userId, runSource, requestedFormats, promptInstructions
+  )
+
+  if (isDocRobot) return runId;  // 文档机器人: 已在 createWorkflow... 内入队 EXECUTE_RUN
+
+  // Step 2: 非文档机器人 - 用 Socket 等待浏览器就绪
+  socket = io(BACKEND_URL/${browserId})
+  socket.on('ready-for-run', () =>
+    readyForRunHandler(browserId, runId, userId, socket)
+    // → 内部调用 executeRun(runId, userId)
+  )
+}
+```
+
+#### 2.4.3 Run 创建：createWorkflowAndStoreMetadata（api/record.ts 版）
+
+[api/record.ts#L552-L654](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L552-L654)
+
+```ts
+async function createWorkflowAndStoreMetadata(
+  id, userId,
+  runSource: 'api' | 'sdk' | 'mcp' | 'cli',    // ← 标记来源
+  requestedFormats?, promptInstructions?
+) {
+  const browserId = isDocRobot ? uuid() : createRemoteBrowserForRun(userId)
+  const run = await Run.create({
+    status: 'running',                           // ← 初始状态直接 running
+    interpreterSettings: { formats, promptInstructions, ... },
+    runByAPI: runSource === 'api',              // ← 四路标记
+    runBySDK: runSource === 'sdk',
+    runByMCP: runSource === 'mcp',
+    runByCLI: runSource === 'cli',
+    ...
+  })
+  serverIo.of('/queued-run').to('user-'+userId).emit('run-started', ...)
+
+  if (isDocRobot) {
+    // 文档机器人也入队 EXECUTE_RUN，与前端手动触发合并
+    addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 })
+  }
+  return { browserId, runId, isDocRobot }
+}
+```
+
+#### 2.4.4 readyForRunHandler → executeRun
+
+[api/record.ts#L691-L713](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L691-L713)
+
+```ts
+async function readyForRunHandler(browserId, id, userId, socket) {
+  const result = await executeRun(id, userId)  // ← api/record.ts 内部的 executeRun
+  // 成功后: resetRecordingState + 清理 socket
+  // 失败后: destroyRemoteBrowser + 清理 socket
+}
+```
+
+---
+
+## 三、执行层：两条执行路径最终合一
+
+### 3.1 执行路径对照
+
+| 路径 | 触发队列 | 执行函数 | 适用场景 |
+|------|---------|---------|---------|
+| **路径 A** | `EXECUTE_RUN` | [task-runner.ts#L130-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L130-L582) `processRunExecution()` | 前端手动触发 + API/SDK/CLI/MCP 的文档机器人 + Cron 的文档机器人 |
+| **路径 B** | `SCHEDULED_WORKFLOW`（后走Socket） | [api/record.ts#L732-L1401](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L732-L1401) `executeRun()`（api版） | API/SDK/CLI/MCP 的非文档机器人 |
+| **路径 C** | `SCHEDULED_WORKFLOW`（后走Socket） | [scheduler/index.ts#L186-L832](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L186-L832) `executeRun()`（scheduler版） | Cron 触发的非文档机器人 |
+
+> **注意**：路径 B 和路径 C 的两个 `executeRun()` 函数 **内容高度相似**（scrape 处理、工作流执行、格式转换、通知发送），但它们分属不同文件。
+
+### 3.2 路径 A：processRunExecution（EXECUTE_RUN 队列处理器）
+
+[task-runner.ts#L130-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L130-L582)
+
+```
+processRunExecution(job)
+  ├─ 前置检查 [L136-L179]
+  │   ├─ Run 状态: aborted/aborting → skip; queued → skip(由恢复处理)
+  │   └─ 机器人类型: doc-extract → executeDocumentRun; doc-parse → executeDocumentParseRun
+  │
+  ├─ 浏览器等待 [L181-L213]
+  │   ├─ browserPool.getRemoteBrowser(browserId)  最多60秒
+  │   └─ getCurrentPage()  最多15秒
+  │
+  ├─ 分支: scrape 类型 [L239-L379]
+  │   ├─ Run.update(status:'running') + Socket 'run-started'
+  │   ├─ 按顺序转换格式 (每个120秒超时):
+  │   │    screenshot-visible/fullpage → text → markdown → summary(LLM) →
+  │   │    html → links → promptInstructions(BrowserAgent LLM)
+  │   ├─ Run.update(status:'success', serializableOutput, binaryOutput)
+  │   ├─ BinaryOutputService 上传 MinIO
+  │   ├─ Socket 'run-completed' + Webhook
+  │   └─ destroyRemoteBrowser()
+  │
+  ├─ 分支: extract/crawl/search 工作流类型 [L381-L555]
+  │   ├─ Run.update(status:'running') + Socket 'run-started'
+  │   ├─ interpreter.setRunId(runId)  实时持久化
+  │   ├─ InterpretRecording()  600秒超时(10分钟)
+  │   ├─ 期间轮询 isRunAborted() → 若中止则提前返回
+  │   ├─ crawl/search 后处理: processRobotOutputFormats()
+  │   ├─ Run.update(status:'success', serializableOutput + binaryOutput)
+  │   ├─ 二进制上传 + Socket + Webhook + triggerIntegrationUpdates()
+  │   └─ destroyRemoteBrowser()
+  │
+  └─ 异常兜底 [L512-L581]
+      ├─ 有部分数据 → triggerIntegrationUpdates()
+      ├─ Run.update(status:'failed', log)
+      ├─ Socket 'run-completed'(失败) + Webhook run_failed
+      └─ 清理浏览器
+```
+
+### 3.3 路径 B/C：executeRun（Socket 回调路径）
+
+以 [api/record.ts#L732-L1401](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L732-L1401) 为例，scheduler/index.ts 版逻辑几乎一致：
+
+```
+executeRun(id, userId)
+  ├─ 前置检查 [L736-L785]
+  │   ├─ Run 状态: aborted/aborting → skip; queued → skip; retryCount>=3 → 永久失败
+  │   ├─ browserPool.getRemoteBrowser() + getCurrentPage()
+  │
+  ├─ 分支 scrape 类型 [L789-L1110]
+  │   └─ (与 processRunExecution 的 scrape 分支完全一致: 格式转换 + 存储 + 通知)
+  │
+  ├─ 分支 extract/crawl/search 工作流类型 [L1112-L1313]
+  │   ├─ AddGeneratedFlags() 在每个 workflow 步骤前插入 'generated' flag
+  │   ├─ interpreter.setRunId()
+  │   ├─ InterpretRecording()  600秒超时
+  │   ├─ crawl/search 后处理: processRobotOutputFormats()
+  │   ├─ BinaryOutputService 上传
+  │   ├─ Run.update(status:'success', ...)
+  │   └─ Socket + Webhook + triggerIntegrationUpdates()
+  │
+  └─ 异常兜底 [L1315-L1401]
+      ├─ Run.update(status:'failed', log + stack)
+      ├─ Socket 'run-completed'(失败) + Webhook run_failed + analytics
+      └─ 清理浏览器
+```
+
+---
+
+## 四、Run 状态机与状态更新（含代码定位）
+
+### 4.1 状态枚举与触发位置
+
+状态定义：[models/Run.ts#L69-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/models/Run.ts#L69-L72)（实际使用值见下表）
+
+| 状态 | 含义 | 设置位置（文件#行号） |
+|------|------|---------------------|
+| `scheduled` | Cron 创建 Run，等待浏览器就绪 | [scheduler/index.ts#L78](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L78) |
+| `queued` | 浏览器槽位不足，排队 | [routes/storage.ts#L1104](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1104) |
+| `running` | 浏览器就绪，执行中 | [routes/storage.ts#L1033](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1033) / [api/record.ts#L590](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L590) / [task-runner.ts#L245](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L245) |
+| `success` | 执行成功 | 多处: [task-runner.ts#L335](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L335), [api/record.ts#L961](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L961), [scheduler/index.ts#L436](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L436) |
 | `failed` | 执行失败（含超时） | 多处 catch 块 |
-| `aborting` | 用户请求中止，正在清理 | storage.ts#L1438, task-runner L592 |
-| `aborted` | 中止已完成 | task-runner.ts#L602/L607, storage.ts#L1443 |
+| `aborting` | 用户请求中止，正在清理 | [routes/storage.ts#L1438](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1438) / [task-runner.ts#L592](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L592) |
+| `aborted` | 中止已完成 | [task-runner.ts#L602-L607](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L602-L607) / [routes/storage.ts#L1443](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1443) |
 
-### 4.2 完整状态流转图
+### 4.2 五路触发对应的初始状态流转
 
 ```
-Cron 任务路径:
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────┐
-│  scheduled  │────▶│   running   │────▶│   success   │ or  │ failed  │
-│ (Run.create)│     │ (execute)   │     │             │     │         │
-└─────────────┘     └──────┬──────┘     └─────────────┘     └─────────┘
-                           │
-                           ▼
-                      ┌──────────┐  ┌─────────┐
-                      │ aborting │─▶│ aborted │
-                      └──────────┘  └─────────┘
-
-手动任务路径:
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────┐
-│   running   │────▶│  (execute)  │────▶│   success   │ or  │ failed  │
-│ (有浏览器)  │     │ processRun  │     │             │     │         │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────┘
-
-排队任务路径:
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────┐
-│   queued    │────▶│   running   │────▶│   success   │ or  │ failed  │
-│ (无浏览器)  │     │ processRun  │     │             │     │         │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────┘
-       │
-       └──── processQueuedRuns() 轮询，每轮检查浏览器槽位
+① Cron 非文档: scheduled ─────┐
+① Cron 文档:   scheduled ──EXECUTE_RUN──▶ running ──┐
+                                                 │
+② 前端手动(有槽): running ──EXECUTE_RUN───────────┤
+② 前端手动(无槽): queued ──processQueuedRuns()──▶ running ──┐
+                                                           │
+③ API / ④ SDK / ⑤ MCP 非文档: running ──socket ready──▶ running ──┐
+③ API / ④ SDK / ⑤ MCP 文档:     running ──EXECUTE_RUN────▶ running ──┐
+                                                                    │
+                                                                    ▼
+                                          ┌─────────────────────────────┐
+                                          │      running (执行中)       │
+                                          └──┬──────────┬───────────┬──┘
+                                             ▼          ▼           ▼
+                                        success     failed    aborting→aborted
 ```
 
-### 4.3 状态更新中的通知机制
+### 4.3 每次状态更新时触发的通知
 
-每次状态变化触发三类通知：
+每次状态更新都会同步触发三类通知（可在对应代码行复核）：
 
-1. **Socket.io 实时推送**（用户前端界面）
-   - 命名空间：`/queued-run` → `user-${userId}` 房间
-   - 命名空间：`/${browserId}`（浏览器专属通道）
-   - 事件：`run-scheduled` / `run-started` / `run-completed` / `run-aborted`
-
-2. **Webhook 回调**（用户配置的外部系统）
-   - 事件类型：`run_completed` / `run_failed`
-   - 载荷包含：run_id、status、extracted_data、error 等
-   - 入口：[routes/webhook.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/webhook.ts) `sendWebhook()`
-
-3. **第三方集成更新**
-   - Google Sheets：`processGoogleSheetUpdates()`
-   - Airtable：`processAirtableUpdates()`
-   - 每个有 65秒 超时保护
+| 通知类型 | 代码行示例 | 事件/载荷 |
+|---------|----------|----------|
+| **Socket.io** | [api/record.ts#L625](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L625), [task-runner.ts#L428-L433](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L428-L433) | 命名空间 `/queued-run` → 房间 `user-${userId}` <br>事件: `run-scheduled` / `run-started` / `run-completed` / `run-aborted` |
+| **Webhook** | [task-runner.ts#L459-L465](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L459-L465), [api/record.ts#L1016-L1027](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L1016-L1027) | 事件: `run_completed` / `run_failed` <br>载荷: run_id, status, extracted_data, metadata 等 |
+| **Integration** | [task-runner.ts#L493-L498](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L493-L498), [api/record.ts#L665-L689](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L665-L689) | Google Sheets: `processGoogleSheetUpdates()` (65秒超时) <br>Airtable: `processAirtableUpdates()` (65秒超时) |
 
 ---
 
-## 五、Graphile Worker 队列系统
+## 五、Graphile Worker 队列层（分流的核心枢纽）
 
 ### 5.1 队列定义
 
-定义于 [task-runner.ts#L37-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L37-L45)：
+[task-runner.ts#L37-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L37-L45)
 
 ```ts
 const QUEUE_NAMES = {
@@ -365,199 +419,188 @@ const QUEUE_NAMES = {
   DESTROY_BROWSER:            'destroy-browser',
   INTERPRET_WORKFLOW:         'interpret-workflow',
   STOP_INTERPRETATION:        'stop-interpretation',
-  EXECUTE_RUN:                'execute-run',        // ← 一次性任务+文档任务
+  EXECUTE_RUN:                'execute-run',          // ← 前端手动 + 文档机器人（所有触发源）
   ABORT_RUN:                  'abort-run',
-  SCHEDULED_WORKFLOW:         'scheduled-workflow', // ← Cron 定时任务
+  SCHEDULED_WORKFLOW:         'scheduled-workflow',   // ← Cron 定时专用
 } as const;
 ```
 
 ### 5.2 addJob 封装
 
-定义于 [storage/graphileWorker.ts#L61-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/storage/graphileWorker.ts#L61-L71)：
+[storage/graphileWorker.ts#L61-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/storage/graphileWorker.ts#L61-L71)
 
 ```ts
 export async function addJob(
-  taskIdentifier: string,        // 对应 QUEUE_NAMES
+  taskIdentifier: string,                    // 对应 QUEUE_NAMES
   payload: Record<string, unknown>,
   options?: {
-    maxAttempts?: number;        // 最大重试次数
-    runAt?: Date;                // 延迟执行时间
-    jobKey?: string;             // 去重键
+    maxAttempts?: number;                    // Cron 用 6，一次性用 1
+    runAt?: Date;                            // 延迟执行
+    jobKey?: string;                         // 去重键
   }
 ): Promise<string>  // 返回 job.id
 ```
 
-### 5.3 Worker 启动配置
+### 5.3 五路触发 → 入队对照
 
-定义于 [task-runner.ts#L681-L716](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L681-L716)：
+| 触发源 | 最终入队的 QUEUE | maxAttempts | 入队代码行 |
+|--------|-----------------|-------------|----------|
+| ① Cron（非文档） | `SCHEDULED_WORKFLOW` | **6** | [schedule-worker.ts#L143](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L143) |
+| ① Cron（文档二次入队） | `EXECUTE_RUN` | **1** | [scheduler/index.ts#L86-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L86-L89) |
+| ② 前端手动（有槽） | `EXECUTE_RUN` | **1** | [routes/storage.ts#L1041-L1045](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1041-L1045) |
+| ② 前端手动（排队后） | `EXECUTE_RUN` | **1** | [routes/storage.ts#L1544-L1548](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1544-L1548) |
+| ③ API（非文档） | **不入队，socket 直接调用 executeRun** | - | [api/record.ts#L1414-L1433](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L1414-L1433) |
+| ③ API（文档） | `EXECUTE_RUN` | **1** | [api/record.ts#L632-L636](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L632-L636) |
+| ④ SDK/CLI | 同 API（共用 handleRunRecording） | - | 同上 |
+| ⑤ MCP | 同 API（共用 handleRunRecording，runSource='mcp'） | - | 同上 |
+
+### 5.4 Worker 启动配置
+
+[task-runner.ts#L681-L716](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L681-L716)
 
 ```ts
 runner = await run({
-  pgPool,
-  concurrency: TOTAL_CONCURRENCY,  // max(1, parseInt(env.WORKER_CONCURRENCY || '10'))
-  noHandleSignals: true,
-  pollInterval: 3600000,           // 1小时轮询（主要靠LISTEN/NOTIFY）
-  taskList,                         // 任务处理函数映射表
+  concurrency: TOTAL_CONCURRENCY,   // max(1, parseInt(env.WORKER_CONCURRENCY || '10'))
+  pollInterval: 3_600_000,          // 1 小时（主要依赖 LISTEN/NOTIFY 实时通知）
+  taskList,                         // 任务处理函数映射表: queueName → handler
 });
 ```
 
-### 5.4 Cron vs 一次性任务在队列中的区别
-
-| 维度 | Cron 任务 | 一次性任务 |
-|------|-----------|------------|
-| 入队队列 | `SCHEDULED_WORKFLOW` | `EXECUTE_RUN` |
-| maxAttempts | 6（重试6次） | 1（不重试） |
-| 执行函数 | `handleRunRecording` → `executeRun` | `processRunExecution` |
-| Run初始状态 | `scheduled` | `running`（有浏览器）/ `queued`（无浏览器） |
-| 浏览器初始化 | handleRunRecording 内同步创建 | API入口创建 / queued轮询后创建 |
-| 文档机器人 | 二次入队 EXECUTE_RUN | 直接执行 processRunExecution 分支 |
-
 ---
 
-## 六、故障恢复与保护机制
+## 六、故障恢复与保护机制（含代码定位）
 
-### 6.1 服务器崩溃恢复
+### 6.1 崩溃恢复：recoverOrphanedRuns
 
-**入口**：[storage.ts#L1572-L1643](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1572-L1643) `recoverOrphanedRuns()`
+[routes/storage.ts#L1572-L1643](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1572-L1643)
 
 服务启动时调用，处理 `status IN ('running', 'scheduled')` 的孤立 Run：
 
 ```
-for each orphaned run:
-  if browserPool中已无对应browser:
-    if retryCount < 3:
-      Run.update({
-        status: 'queued',
-        retryCount++,
-        browserId: undefined,
-        log: '[RETRY N/3] Re-queuing due to server crash'
-      })
-    else:
+条件: status in ('running','scheduled') AND browserPool中无对应browser
+  ├─ retryCount < 3:
+  │   Run.update({
+  │     status: 'queued',
+  │     retryCount++,
+  │     browserId: undefined,
+  │     log: '[RETRY N/3] Re-queuing due to server crash'
+  │   })
+  └─ retryCount >= 3:
       Run.update({ status: 'failed', log: 'Max retries exceeded...' })
-  else:
-    // 浏览器仍然活跃 → 不处理
 ```
 
 ### 6.2 Cron 认领超时
 
-在 `claimDueDbSchedules()` 中：
-```ts
-claimExpiry = NOW() - 10 * 60 * 1000  // 10分钟
-// 条件: schedulerClaimedAt IS NULL OR < claimExpiry
-```
-- 若调度器崩溃，认领标记10分钟后自动失效
-- 下次轮询会重新认领该任务
+[schedule-worker.ts#L62-L65](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L62-L65)
 
-### 6.3 熔断器（processQueuedRuns）
-
-连续3次DB错误后，打开熔断器，30秒内不再处理排队任务：
 ```ts
-consecutiveDbErrors >= 3 → circuitBreakerOpenUntil = NOW() + 30000
+claimExpiry = NOW() - 10 * 60 * 1000   // 10 分钟
+WHERE: schedulerClaimedAt IS NULL OR schedulerClaimedAt < claimExpiry
 ```
 
-### 6.4 执行超时保护
+> 调度器崩溃 10 分钟后，认领标记自动失效，下次轮询重新认领。
 
-- 浏览器初始化超时：60秒
-- Page 就绪超时：15秒
-- 工作流执行超时：600秒（10分钟）
-- Scrape 格式转换超时：每个120秒
-- Integration 更新超时：每个65秒
+### 6.3 排队任务熔断器
+
+[routes/storage.ts#L1507-L1515](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1507-L1515)
+
+```ts
+consecutiveDbErrors >= 3
+  → circuitBreakerOpenUntil = NOW() + 30_000   // 冷却 30 秒
+```
+
+### 6.4 多层超时保护
+
+| 超时项 | 代码行 | 值 |
+|-------|-------|-----|
+| 浏览器初始化 | [task-runner.ts#L183](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L183) | 60 秒 |
+| Page 就绪 | [task-runner.ts#L219](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L219) | 15 秒 |
+| 工作流 Interpret | [task-runner.ts#L405](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/task-runner.ts#L405) | 600 秒（10分钟） |
+| Scrape 格式转换 | [api/record.ts#L818](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L818) | 每个 120 秒 |
+| Integration 更新 | [api/record.ts#L681-L685](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L681-L685) | 每个 65 秒 |
+| Socket 连接 | [api/record.ts#L1423](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L1423) | 30 秒 |
 
 ---
 
-## 七、关键数据模型
+## 七、关键数据模型字段对照（含代码定位）
 
-### 7.1 Robot.schedule (JSONB)
+### 7.1 Robot.schedule（JSONB）
 
-定义于 [models/Robot.ts#L61-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/models/Robot.ts#L61-L73)：
+定义: [models/Robot.ts#L61-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/models/Robot.ts#L61-L73)
 
-```ts
-interface ScheduleConfig {
-  runEvery: number;
-  runEveryUnit: 'MINUTES' | 'HOURS' | 'DAYS' | 'WEEKS' | 'MONTHS';
-  startFrom: 'SUNDAY'..'SATURDAY';
-  atTimeStart?: string;     // 'HH:mm'
-  atTimeEnd?: string;
-  timezone: string;         // e.g. 'Asia/Shanghai'
-  lastRunAt?: Date;
-  nextRunAt?: Date;         // ← 轮询判断的核心字段
-  dayOfMonth?: string;
-  cronExpression?: string;  // ← 实际调度表达式
-  schedulerClaimedAt?: Date; // ← 分布式锁标记
-}
-```
+| 字段 | 类型 | 写入位置 | 读取位置 |
+|------|------|---------|---------|
+| `cronExpression` | string | [routes/storage.ts#L1225-L1342](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1225-L1342) `PUT /schedule/:id/` / [api/sdk.ts#L528-L554](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/sdk.ts#L528-L554) | [schedule-worker.ts#L60](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L60) |
+| `nextRunAt` | Date | [storage/schedule.ts#L15](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/storage/schedule.ts#L15) `scheduleWorkflow()` / [schedule-worker.ts#L101](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L101) `finalizeSchedule()` | [schedule-worker.ts#L61](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L61) |
+| `schedulerClaimedAt` | Date | [schedule-worker.ts#L79](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L79) 认领时 / [schedule-worker.ts#L105](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L105) finalize时清零 | [schedule-worker.ts#L62-L65](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/schedule-worker.ts#L62-L65) |
+| `timezone` | string | 同上 cronExpression 写入 | [utils/schedule.ts#L8](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/utils/schedule.ts#L8) `computeNextRun()` |
 
 ### 7.2 Run 核心字段
 
-定义于 [models/Run.ts#L14-L35](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/models/Run.ts#L14-L35)：
+定义: [models/Run.ts#L14-L35](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/models/Run.ts#L14-L35)
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `status` | string | 状态机核心字段 |
-| `runId` | UUID | 对外暴露的Run ID（不同于主键id） |
-| `robotMetaId` | UUID | 关联 Robot.recording_meta.id |
-| `browserId` | UUID | 关联浏览器实例 |
-| `startedAt` / `finishedAt` | string | 开始/结束时间（本地化字符串） |
-| `interpreterSettings` | JSONB | maxConcurrency, formats, robotType 等 |
-| `serializableOutput` | JSONB | 结构化结果（markdown, scrapeSchema 等） |
-| `binaryOutput` | JSONB | MinIO URL映射 |
-| `retryCount` | int | 崩溃重试计数（默认0，最多3次） |
-| `runByUserId` | int | 触发用户 |
-| `runByScheduleId` | UUID | Cron任务专用 |
-| `runByAPI` / `SDK` / `MCP` / `CLI` | bool | 调用来源标记 |
+| 字段 | 设置位置（五路触发各有不同） |
+|------|---------------------------|
+| `status` | Cron → `scheduled`; 前端(有槽) → `running`; 前端(无槽) → `queued`; API/SDK/CLI/MCP → `running` |
+| `runByScheduleId` | 仅 Cron: [scheduler/index.ts#L83](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/workflow-management/scheduler/index.ts#L83) |
+| `runByAPI` | API/MCP: [api/record.ts#L601](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L601)（MCP 时为 false） |
+| `runBySDK` | SDK: [api/record.ts#L602](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L602) |
+| `runByMCP` | MCP: [api/record.ts#L603](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L603) |
+| `runByCLI` | CLI: [api/record.ts#L604](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/api/record.ts#L604) |
+| `retryCount` | 崩溃恢复时递增: [routes/storage.ts#L1601](file:///d:/fz/0601-2/solo-dogfeeding/code/111-maxun/server/src/routes/storage.ts#L1601) |
 
 ---
 
-## 八、分流总结：Cron vs 一次性任务
+## 八、分流总览：从触发到入队到执行的完整路径
 
 ```
-用户动作:
-  "设置调度规则"          "点击立即运行"
-       │                       │
-       ▼                       ▼
-  PUT /schedule/:id     PUT /runs/:id
-       │                       │
-       ▼                       ▼
-  scheduleWorkflow()    ┌──────┴───────┐
-  写 cronExpression     │ 检查浏览器槽  │
-  + nextRunAt           │              │
-       │            有槽▼              ▼无槽
-       │          Run(status:running) Run(status:queued)
-       │          add EXECUTE_RUN     │  由 processQueuedRuns
-       │                              │  轮询后转 running
-       │                              └─────┬──────┘
-       ▼                                    ▼
-  ┌──────────────────────┐        EXECUTE_RUN 队列
-  │ schedule-worker 轮询 │        (Graphile Worker)
-  │ 每30秒扫描 Robot表   │               │
-  └──────────┬───────────┘               ▼
-             │                   processRunExecution()
-             ▼                           │
-  claimDueDbSchedules()                  │
-  (咨询锁+SKIP LOCKED)                   │
-             │                           │
-             ▼                           │
-  SCHEDULED_WORKFLOW 队列                │
-  (Graphile Worker, maxAttempts=6)       │
-             │                           │
-             ▼                           │
-  handleRunRecording()                   │
-             │                           │
-    ┌────────┴────────┐                  │
-    │ doc robot?      │                  │
-    ├─Yes────add EXECUTE_RUN─────────────┤
-    │                                     │
-    └─No──create browser──socket─────────┘
-             │
-             ▼
-        executeRun()
-  (Cron任务专用执行函数，逻辑与
-   processRunExecution 高度相似)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          触发源 (5 路进入)                                    │
+├──────────┬──────────┬──────────┬──────────┬─────────────────────────────────┤
+│ ① Cron   │ ② 前端  │ ③ API    │ ④ SDK    │ ⑤ MCP (mcp-worker.ts)          │
+│ schedule │ 手动    │ /api/    │ /api/sdk │ HTTP: POST /api/robots/:id/runs │
+│ -worker  │ PUT /   │ robots/  │ /robots/ │ x-run-source: 'mcp'             │
+│          │ runs/:id│ :id/runs │ :id/exec │                                 │
+└────┬─────┴────┬────┴────┬────┴────┬────┴────────────┬────────────────────┘
+     │          │         │         │                 │
+     ▼          ▼         ▼         ▼                 ▼
+ SCHEDULED_  直接入队    handleRunRecording (api/record.ts#L1403)
+ WORKFLOW    EXECUTE_RUN createWorkflowAndStoreMetadata (api/record.ts#L552)
+ (max=6)     (max=1)     Run.status='running', 标记 runByAPI/SDK/MCP/CLI
+     │          │         │                       │
+     │          │    非文档│socket等待             │文档
+     │          │         ▼                       ▼
+     │          │    ready-for-run            addJob(EXECUTE_RUN, max=1)
+     ▼          │    executeRun()                   │
+ scheduler/     │    (api/record.ts#L732)           │
+ index.ts       │                                    │
+ handleRunRecording (scheduler版)                    │
+     │          │                                    │
+     │    ┌─────┴────────────────────────────────────┘
+     │    ▼
+     │  ┌──────────────────────────────────────────────────────────┐
+     │  │         Graphile Worker: EXECUTE_RUN                     │
+     │  │         task-runner.ts#L130 processRunExecution()        │
+     │  │         处理: 前端手动(有槽/排队) + 文档类(Cron/API/SDK..) │
+     │  └──────────────────────────┬───────────────────────────────┘
+     │                             │
+     ▼                             ▼
+ ┌──────────────────────────────────────────────────────────────┐
+ │                    执行函数（内容高度相似）                       │
+ │  processRunExecution  │  executeRun (api版) │ executeRun(s版) │
+ │  task-runner.ts       │  api/record.ts      │ scheduler/      │
+ │  #L130-L582           │  #L732-L1401        │ index.ts #L186   │
+ └──────────────────────┬──────────────────────┴──────────────────┘
+                        ▼
+          ┌─────────────────────────────────────────┐
+          │ 状态更新: running → success/failed       │
+          │ 通知: Socket.io + Webhook + Integration │
+          └─────────────────────────────────────────┘
 ```
 
-**核心分流点**：
-1. **入口不同**：Cron 通过 `schedule-worker` DB轮询 → `SCHEDULED_WORKFLOW`；一次性任务通过 REST API → `EXECUTE_RUN`
-2. **初始状态不同**：Cron创建的Run是 `scheduled`，一次性任务是 `running` 或 `queued`
-3. **执行路径部分合并**：Cron文档机器人也会二次入队 `EXECUTE_RUN`，最终与一次性任务汇合
-4. **重试策略不同**：Cron调度失败最多重试6次（`SCHEDULED_WORKFLOW`），一次性任务执行不重试（`maxAttempts: 1`）
-5. **浏览器创建时机不同**：一次性任务在API入口先创建浏览器再入队；Cron任务在 `handleRunRecording` 内部创建浏览器
+**分流与汇合的关键节点总结**：
+
+1. **入队前的最大分叉**：5 路触发源分成 **Cron 专用队列（SCHEDULED_WORKFLOW）**、**前端专用队列（EXECUTE_RUN）**、**API/SDK/CLI/MCP 的 socket 直调路径（不入队）** 三种模式。
+2. **文档机器人的汇合点**：无论来自哪路触发，文档机器人最终都入队 `EXECUTE_RUN`，统一由 `processRunExecution()` 的 doc-extract/doc-parse 分支处理。
+3. **执行函数的分叉**：虽然有 3 个不同的执行函数（processRunExecution / 两个 executeRun），但内部逻辑（scrape处理、工作流执行、格式后处理、通知发送）高度一致，本质是同一逻辑的重复实现。
+4. **状态更新的统一出口**：无论走哪条路径，成功/失败状态更新时都触发相同的 Socket/Webhook/Integration 三类通知。
