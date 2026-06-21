@@ -7,7 +7,7 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  任务调度层 (Task Scheduler)                            │
-│  - task-runner.ts (Graphile Worker 任务队列)            │
+│  - server/src/task-runner.ts (Graphile Worker 任务队列) │
 │  - scheduler/index.ts (定时调度器)                      │
 │  - routes/workflow.ts (HTTP API 触发)                   │
 └──────────────────────┬──────────────────────────────────┘
@@ -45,7 +45,7 @@
 工作流执行有 **三种触发方式**：
 
 #### (1) 手动 Run 触发
-入口：[task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/task-runner.ts#L660-L662)
+入口：`server/src/task-runner.ts`
 
 ```typescript
 // Graphile Worker 任务队列处理 EXECUTE_RUN 任务
@@ -55,7 +55,7 @@
 ```
 
 #### (2) 定时调度触发
-入口：[scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/workflow-management/scheduler/index.ts#L860-L909)
+入口：`server/src/workflow-management/scheduler/index.ts`
 
 ```typescript
 // handleRunRecording 函数创建 Run 记录并等待浏览器就绪
@@ -67,7 +67,7 @@ export async function handleRunRecording(id: string, userId: string) {
 ```
 
 #### (3) 编辑器内回放
-入口：[RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L863-L894)
+入口：`server/src/browser-management/classes/RemoteBrowser.ts`
 
 ```typescript
 public interpretCurrentRecording = async (): Promise<void> => {
@@ -80,7 +80,7 @@ public interpretCurrentRecording = async (): Promise<void> => {
 
 ### 2.2 Workflow 数据结构
 
-工作流文件格式定义在 [workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/types/workflow.ts#L49-L60)：
+工作流文件格式定义在 `maxun-core/src/types/workflow.ts`：
 
 ```typescript
 // 单个步骤 (Where-What 对)
@@ -105,7 +105,7 @@ type WorkflowFile = {
 
 ### 2.3 核心调度循环 runLoop()
 
-核心调度逻辑位于 [interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/interpret.ts#L2689-L2872)。
+核心调度逻辑位于 `maxun-core/src/interpret.ts`。
 
 #### 执行流程：
 
@@ -128,15 +128,15 @@ Interpreter.run(page, params)
               ├─ [5] 匹配动作 (当前简化为取最后一个)
               │     actionId = workflowCopy.length - 1
               │
-              ├─ [6] 断点/重复检查
-              │     ├─ 触发 debugChannel.activeId 回调
-              │     └─ 超过 maxRepeats 则抛出错误
+              ├─ [6] 重复检查: repeatCount > maxRepeats 则 throw Error
+              │     └─ (repeatCount 累加的前提是 action === lastAction)
               │
               ├─ [7] 执行动作: carryOutSteps(page, action.what)
+              │     │
+              │     ├─ 成功: usedActions.push() → workflowCopy.splice() → loopIterations=0
+              │     └─ 失败: catch 后记录日志 → continue 下一轮循环 (动作不移除)
               │
-              ├─ [8] 标记完成: usedActions.push()
-              ├─ [9] 从 workflowCopy 中移除已执行步骤
-              └─ [10] 重置 loopIterations
+              └─ [8] (回到循环顶部)
 ```
 
 #### 关键机制说明：
@@ -158,7 +158,7 @@ p.on('popup', popupHandler);
 
 **(3) 进度反馈**
 
-每次执行完步骤后通过 `debugChannel.progressUpdate` 回调向前端推送执行进度。
+每次成功执行完步骤后通过 `debugChannel.progressUpdate` 回调向前端推送执行进度（失败时不推送）。
 
 ---
 
@@ -166,7 +166,7 @@ p.on('popup', popupHandler);
 
 ### 3.1 动作分发器 carryOutSteps()
 
-位于 [interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/interpret.ts#L550-L1953)，负责将 `what[]` 中的每个动作分发到具体执行逻辑。
+位于 `maxun-core/src/interpret.ts`，负责将 `what[]` 中的每个动作分发到具体执行逻辑。
 
 #### 动作分类：
 
@@ -231,6 +231,7 @@ const scrapeResult = await page.evaluate(
 - 限制：尊重 `config.limit` 参数
 - XPath 支持：选择器自动识别 XPath / CSS 语法
 - Shadow DOM / iframe 穿透：使用 `>>` 和 `:>>` 分隔符
+- 分页选择器重试：MAX_RETRIES=3，每次间隔 RETRY_DELAY=1000ms
 
 #### (3) crawl - 全站爬取
 
@@ -261,7 +262,7 @@ While 队列非空 && 结果数 < limit:
 
 ### 3.3 浏览器端注入脚本 scraper.js
 
-位于 [scraper.js](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/browserSide/scraper.js)，通过 `page.addInitScript()` 在每个页面加载前注入。
+位于 `maxun-core/src/browserSide/scraper.js`，通过 `page.addInitScript()` 在每个页面加载前注入。
 
 暴露以下全局函数：
 
@@ -291,84 +292,166 @@ const needsDataSoon = this.blockNeedsVisualRender(steps)
   || this.remainingWorkflowNeedsVisualRender(remaining);
 existingOpts.waitUntil = needsDataSoon ? 'networkidle' : 'domcontentloaded';
 ```
+失败处理：try-catch 吞掉异常，仅记录 WARN 日志，**继续执行后续动作**。
 
 #### (2) `click` 失败重试
 ```typescript
 try {
   await page.click(selector);
 } catch {
-  // 重试：使用 force: true 跳过可操作性检查
-  await page.click(selector, { force: true });
+  try {
+    // 重试：使用 force: true 跳过可操作性检查
+    await page.click(selector, { force: true });
+  } catch {
+    // 两次都失败：continue 跳到下一个 step
+    continue;
+  }
 }
 ```
 
 #### (3) `waitForLoadState` 降级
-请求 `networkidle` 但超时时自动降级为 `domcontentloaded`。
+请求 `networkidle` 但超时时自动降级为 `domcontentloaded`。降级后也失败则不抛异常。
 
----
-
-## 四、失败处理链路
-
-### 4.1 多层异常捕获
-
-```
-┌──────────────────────────────────────────────────┐
-│ Layer 1: task-runner.ts 顶层 try-catch           │
-│   - 更新 Run.status = 'failed'                    │
-│   - 发送失败 webhook / socket 通知                │
-│   - 触发 analytics 埋点                          │
-│   - 清理浏览器资源                                │
-└──────────────────────┬───────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────┐
-│ Layer 2: WorkflowInterpreter 层                  │
-│   - serializableCallback / binaryCallback 异常   │
-│   - 持久化缓冲区刷盘失败重试                      │
-│   - 加密输入解密失败降级                          │
-└──────────────────────┬───────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────┐
-│ Layer 3: Interpreter.runLoop()                   │
-│   - 单步骤失败: catch 后 continue 继续下一步      │
-│   - maxRepeats: 同一步骤重复执行超限则抛错终止     │
-│   - isAborted: 用户中止标志立即停止               │
-│   - MAX_LOOP_ITERATIONS: 死循环保护(1000次)      │
-└──────────────────────┬───────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────┐
-│ Layer 4: carryOutSteps() 单动作容错              │
-│   - goto/waitForLoadState 失败降级                │
-│   - click 失败用 force:true 重试                 │
-│   - 其他通用动作: 失败记录日志后 continue          │
-└──────────────────────┬───────────────────────────┘
-                       ▼
-┌──────────────────────────────────────────────────┐
-│ Layer 5: 特定动作内部重试                        │
-│   - scrapeList 分页: MAX_RETRIES=3 + 退避延迟    │
-│   - search: DuckDuckGo 结果提取重试              │
-│   - crawl: 单 URL 失败不终止整个爬取             │
-└──────────────────────────────────────────────────┘
+#### (4) 其他通用原生动作
+```typescript
+try {
+  await executeAction(invokee, methodName, step.args);
+} catch (error: any) {
+  this.log(`Action ${methodName} failed: ${error.message}`, Level.ERROR);
+  continue;  // 跳到下一个 step，不抛错
+}
 ```
 
 ---
 
-### 4.2 超时控制
+## 四、失败处理链路（对照代码事实）
+
+### 4.1 单个动作失败后的处理路径（核心）
+
+这是最容易误解的部分，以下是严格对照代码事实的描述：
+
+```
+carryOutSteps() 遍历 steps[] 中的每个 step:
+    │
+    ├─ 动作分类
+    │   ├─ Playwright 原生动作 (goto/click/wait/其他):
+    │   │   ├─ goto/waitForLoadState: 内部 try-catch 吞掉 → 继续下一个 step
+    │   │   ├─ click: 第1次失败 → force:true 重试 → 再失败 → continue 下一个 step
+    │   │   └─ 其他原生动作: 失败 → continue 下一个 step
+    │   │
+    │   └─ 自定义 wawActions (scrape/scrapeList/scrapeSchema/...):
+    │       └─ 无内部 try-catch → 失败直接抛出异常
+    │          │
+    │          └─ 异常冒泡到 runLoop() 的外层 try-catch
+    │
+    ▼
+runLoop() 外层 catch (L2861-L2864):
+    ├─ this.log(e, Level.ERROR)   // 记录错误日志
+    └─ continue                   // 直接进入下一轮 while 循环
+         │
+         ▼
+    下一轮循环发生了什么？
+    ├─ [动作不移除] workflowCopy.splice(actionId, 1) 未被执行
+    │   → 同一个 WhereWhatPair 仍留在 workflowCopy 中
+    │
+    ├─ [匹配同一动作] actionId = workflowCopy.length - 1
+    │   → 仍然匹配到同一个失败的动作
+    │
+    ├─ [repeatCount 累加] action === lastAction → repeatCount++
+    │   → 因为同一个动作对象反复被匹配
+    │
+    ├─ [loopIterations 累加] 成功时才会 reset loopIterations=0
+    │   → 失败时不 reset，持续 +1
+    │
+    └─ [两种可能的结局]
+        ├─ 结局 A: repeatCount > maxRepeats
+        │   → throw new Error(`Action xxx exceeded max retries`)
+        │   → 整个 runLoop 终止 → 异常继续向上冒泡
+        │
+        └─ 结局 B: loopIterations > MAX_LOOP_ITERATIONS (1000)
+            → 直接 return，静默终止 runLoop
+```
+
+**结论（对照代码事实）：**
+
+| 问题 | 答案 | 代码依据 |
+|------|------|---------|
+| 单个 WhereWhatPair 内某个 step 失败，会不会移除当前动作？ | **原生动作（goto/click等）失败：不会移除，继续同 Pair 内下一个 step**<br>**自定义动作（scrape/scrapeList等）失败：整个 Pair 都不会被移除** | `carryOutSteps` 内 `continue` 跳到下一个 step；`runLoop` 内 catch 后 `continue`，不执行 `splice` |
+| 会不会反复重试同一个动作？ | **会**，但不是无限重试。自定义动作反复失败会触发 `maxRepeats` 保护或 `MAX_LOOP_ITERATIONS` 死循环保护 | `runLoop` L2814-L2824（maxRepeats）、L2737-L2741（1000次保护） |
+| 重试是"原地重试"还是"进入下一轮循环"？ | **进入下一轮 while 循环**。不是在当前 try 块内 retry，而是走完整的循环流程（包括 waitForLoadState、匹配动作等） | `runLoop` L2864 `continue` 语句 |
+| 单个 step 失败会不会终止整个工作流？ | **一般不会**，除非：① 触发 maxRepeats 超限 ② 触发 MAX_LOOP_ITERATIONS ③ 用户中止 ④ 顶层（如 browser.init）抛出致命错误 | 见五层异常捕获体系 |
+
+---
+
+### 4.2 五层异常捕获体系
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 1: server/src/task-runner.ts 顶层 try-catch (L136)     │
+│   - 捕获所有未被下层吞掉的异常                                 │
+│   - 更新 Run.status = 'failed'                                │
+│   - 发送失败 webhook / socket 通知                            │
+│   - 触发 analytics 埋点                                       │
+│   - 清理浏览器资源 destroyRemoteBrowser()                     │
+└──────────────────────┬───────────────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 2: server/src/workflow-management/classes/Interpreter.ts│
+│   - serializableCallback: try-catch 吞掉异常 (L705-L707)      │
+│   - binaryCallback: try-catch 吞掉异常 (L731-L733)            │
+│   - flushPersistenceBuffer: 指数退避重试 (最多3次)             │
+│   - InterpretRecording() 本身无 try-catch                     │
+│     → interpreter.run() 抛出的异常直接向上冒泡                │
+└──────────────────────┬───────────────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 3: maxun-core/src/interpret.ts runLoop() 外层 try-catch │
+│   - 包裹 carryOutSteps() 调用 (L2832-L2865)                   │
+│   - catch 后只记录日志 + continue，不抛出                      │
+│   - 但 maxRepeats 超限时会主动 throw Error (L2823)            │
+│   - MAX_LOOP_ITERATIONS 超限时直接 return 不抛                │
+│   - waitForLoadState() 失败: 关闭页面 + return (L2750-L2756)  │
+└──────────────────────┬───────────────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 4: carryOutSteps() 每个 step 的 try-catch               │
+│   - goto/waitForLoadState: 内部 try-catch 降级 + 吞掉         │
+│   - click: 失败 → force:true 重试 → 再失败 continue           │
+│   - 其他原生动作: 失败 → continue 下一个 step                  │
+│   - 自定义 wawActions: **无内部 try-catch**                   │
+│     → 失败直接抛出到 Layer 3                                  │
+└──────────────────────┬───────────────────────────────────────┘
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Layer 5: 特定动作内部重试                                      │
+│   - handlePagination() 分页: MAX_RETRIES=3 + RETRY_DELAY=1s  │
+│     → 分页选择器失败: 3次重试后剔除该选择器，不抛错            │
+│     → 分页点击操作: 3次重试后放弃本页，不抛错                  │
+│   - scrapeList/crawl/search: 单条记录失败不终止整体抓取        │
+│   - enqueueLinks: 单个新页面失败 try-catch 吞掉 (L619-L624)   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4.3 超时控制
 
 | 阶段 | 超时值 | 位置 |
 |------|--------|------|
-| 浏览器初始化 | 45s | [RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L420) |
-| 浏览器池等待 | 60s | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/task-runner.ts#L131) |
-| Page 获取 | 15s | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/task-runner.ts#L132) |
-| 工作流整体执行 | 600s (10分钟) | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/task-runner.ts#L401) |
-| 单页面导航 | 15s (默认) | [interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/interpret.ts#L1888) |
-| 浏览器销毁 | 30s | [controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/browser-management/controller.ts#L158) |
-| 脚本注入检查 | 3s | [interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/interpret.ts#L2886) |
+| 浏览器初始化 | 45s | `server/src/browser-management/classes/RemoteBrowser.ts` |
+| 浏览器池等待 | 60s | `server/src/task-runner.ts` |
+| Page 获取 | 15s | `server/src/task-runner.ts` |
+| 工作流整体执行 | 600s (10分钟) | `server/src/task-runner.ts` |
+| 单页面导航 | 15s (默认) | `maxun-core/src/interpret.ts` |
+| 浏览器销毁 | 30s | `server/src/browser-management/controller.ts` |
+| 脚本注入检查 | 3s | `maxun-core/src/interpret.ts` |
+| 分页选择器重试间隔 | 1s | `maxun-core/src/interpret.ts` handlePagination |
 
 所有超时均通过 `Promise.race([promise, timeoutPromise])` 模式实现。
 
 ---
 
-### 4.3 用户中止流程
+### 4.4 用户中止流程
 
 ```
 用户点击停止 / abort API
@@ -380,8 +463,9 @@ abortRun(runId, userId)
     ├─► interpreter.abort()  // 设置 isAborted = true
     │
     ├─► 每一层循环/动作检查 isAborted 标志
-    │   ├─ runLoop 顶部检查
-    │   ├─ carryOutSteps 每步检查
+    │   ├─ runLoop 顶部检查 (L2730-L2734)
+    │   ├─ carryOutSteps 入口检查 (L551-L554)
+    │   ├─ scrapeSchema 内部检查 (L654-L657)
     │   ├─ scrapeList/crawl/search 内部循环检查
     │   └─ handlePagination 分页循环检查
     │
@@ -393,9 +477,9 @@ abortRun(runId, userId)
 
 ---
 
-### 4.4 持久化重试机制
+### 4.5 持久化重试机制
 
-WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 [Interpreter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/workflow-management/classes/Interpreter.ts#L827-L952)）：
+WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 `server/src/workflow-management/classes/Interpreter.ts`）：
 
 ```
 动作产生数据 → addToPersistenceBatch()
@@ -417,7 +501,7 @@ WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 
 
 ---
 
-### 4.5 日志与调试通道
+### 4.6 日志与调试通道
 
 通过 `debugChannel` 回调接口，maxun-core 将内部状态推送给上层：
 
@@ -428,7 +512,7 @@ WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 
 | `setActionType(type)` | 执行动作前，设置动作类型 (scrapeList/screenshot/...) |
 | `setActionName(name)` | 设置当前动作的用户命名 |
 | `incrementScrapeListIndex()` | scrapeList 每次分页抓取后 |
-| `progressUpdate(current, total, percent)` | 步骤完成后更新总进度 |
+| `progressUpdate(current, total, percent)` | **仅步骤成功完成后** 更新总进度 |
 
 另外，编辑器模式下的 `flag` 事件支持 **断点暂停、步进执行、恢复** 三种调试能力。
 
@@ -440,7 +524,7 @@ WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 
 
 ```
 [1] 前端调用 API POST /workflow/run
-     ↓ routes/workflow.ts
+     ↓ server/src/routes/workflow.ts
 [2] 创建 Run 记录 (status=scheduled)
      ↓ createRemoteBrowserForRun()
 [3] 预留浏览器池槽位 → 异步启动浏览器初始化
@@ -449,8 +533,8 @@ WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 
 [4] 浏览器准备完毕 → socket emit('ready-for-run')
      ↓ Graphile Worker 投递 EXECUTE_RUN 任务
 [5] processRunExecution() 开始处理
-     ↓ 轮询 browserPool.getRemoteBrowser() 等待浏览器就绪
-[6] 获取 Page 对象
+     ↓ 轮询 browserPool.getRemoteBrowser() 等待浏览器就绪 (60s timeout)
+[6] 获取 Page 对象 (15s timeout)
      ↓ browser.interpreter.setRunId(runId)
 [7] WorkflowInterpreter.InterpretRecording()
      ↓ processWorkflow() 解密加密输入、限制 scrapeList limit
@@ -489,14 +573,14 @@ WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 
 
 | 文件 | 职责 |
 |------|------|
-| [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/task-runner.ts) | Graphile Worker 任务队列、Run 执行总控 |
-| [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/workflow-management/scheduler/index.ts) | 定时调度、Run 创建流程 |
-| [Interpreter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/workflow-management/classes/Interpreter.ts) | 服务端解释器封装（数据持久化、Socket 通信） |
-| [controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/browser-management/controller.ts) | 浏览器生命周期管理（创建/销毁/查询） |
-| [RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/browser-management/classes/RemoteBrowser.ts) | 单个浏览器会话封装（含 interpreter、generator） |
-| [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/browser-management/classes/BrowserPool.ts) | 浏览器池（每用户最多 2 个浏览器、槽位预留） |
-| [maxun-core/interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/interpret.ts) | 核心解释器：runLoop、carryOutSteps、动作实现 |
-| [maxun-core/preprocessor.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/preprocessor.ts) | 工作流预处理：参数替换、正则编译、校验 |
-| [maxun-core/types/workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/types/workflow.ts) | 工作流类型定义 |
-| [maxun-core/browserSide/scraper.js](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/maxun-core/src/browserSide/scraper.js) | 浏览器端注入脚本（数据抓取函数） |
-| [storage/graphileWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/110-maxun/server/src/storage/graphileWorker.ts) | Graphile Worker 任务投递封装 |
+| `server/src/task-runner.ts` | Graphile Worker 任务队列、Run 执行总控、顶层异常捕获 |
+| `server/src/workflow-management/scheduler/index.ts` | 定时调度、Run 创建流程 |
+| `server/src/workflow-management/classes/Interpreter.ts` | 服务端解释器封装（数据持久化、Socket 通信、批量落库重试） |
+| `server/src/browser-management/controller.ts` | 浏览器生命周期管理（创建/销毁/查询） |
+| `server/src/browser-management/classes/RemoteBrowser.ts` | 单个浏览器会话封装（含 interpreter、generator） |
+| `server/src/browser-management/classes/BrowserPool.ts` | 浏览器池（每用户最多 2 个浏览器、槽位预留状态机） |
+| `maxun-core/src/interpret.ts` | 核心解释器：runLoop 主循环、carryOutSteps 动作分发、各动作实现 |
+| `maxun-core/src/preprocessor.ts` | 工作流预处理：参数替换、正则编译、校验 |
+| `maxun-core/src/types/workflow.ts` | 工作流类型定义（WhereWhatPair、Workflow 等） |
+| `maxun-core/src/browserSide/scraper.js` | 浏览器端注入脚本（数据抓取函数、Shadow DOM/iframe 穿透） |
+| `server/src/storage/graphileWorker.ts` | Graphile Worker 任务投递封装 |
