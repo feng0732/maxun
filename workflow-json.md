@@ -740,6 +740,49 @@ private async carryOutSteps(page: Page, steps: What[], currentWorkflow?: Workflo
 
 ### 8.1 API 入口：POST /api/sdk/robots
 
+#### 8.1.1 路由挂载关系（为什么带 /api 前缀）
+
+文件位置：`server/src/server.ts`
+
+Maxun 后端使用 Express，路由分两套体系挂载：
+
+```
+Express app
+    │
+    ├── 直接挂载的路由（无前缀）：
+    │     ├── /webhook     ← server/src/routes/webhook.ts
+    │     ├── /record      ← server/src/routes/record.ts
+    │     ├── /workflow    ← server/src/routes/workflow.ts   （GUI 录制用）
+    │     ├── /storage     ← server/src/routes/storage.ts
+    │     ├── /auth        ← server/src/routes/auth.ts
+    │     └── /proxy       ← server/src/routes/proxy.ts
+    │
+    └── /api 前缀下的路由（api/ 目录统一挂载）：
+          └── /sdk/...     ← server/src/api/sdk.ts
+```
+
+挂载代码（`server/src/server.ts` 第 127-135 行）：
+
+```typescript
+// 遍历 api/ 目录下的所有文件，统一挂载到 /api 前缀下
+readdirSync(path.join(__dirname, 'api')).forEach((r) => {
+  const route = require(path.join(__dirname, 'api', r));
+  const router = route.default || route;
+  if (typeof router === 'function') {
+    app.use('/api', router);   // 关键：所有 api/ 目录的路由都加 /api 前缀
+  }
+});
+```
+
+**为什么带 /api 前缀**：
+- **分层设计**：`api/` 目录下的路由被设计为对外的 API 接口（如 SDK），统一加 `/api` 前缀与内部 GUI 路由区分
+- **自动挂载**：通过 `readdirSync` 遍历 `api/` 目录自动挂载，新增文件无需手动改 `server.ts`
+- **命名空间隔离**：`/api/*` 对外，`/workflow`、`/auth` 等对内（GUI 前端用），职责明确
+
+因此，SDK 路由在 `sdk.ts` 中定义的是 `/sdk/robots`，经过 `app.use('/api', router)` 挂载后，**外部访问的完整路径是 `/api/sdk/robots`**。
+
+#### 8.1.2 处理流程
+
 文件位置：`server/src/api/sdk.ts`
 
 SDK 用户提交的是"简化格式"的工作流，API 路由处理以下核心步骤：
@@ -1422,9 +1465,10 @@ JSON.stringify(obj) 自动序列化
 
 ### 8.7 关键代码文件索引（SDK 路径）
 
-| 文件 | 主要职责 | 关键函数/方法 |
+| 文件 | 主要职责 | 关键函数/路由 |
 |-----|---------|-------------|
-| `server/src/api/sdk.ts` | SDK API 路由，统一入口 | `POST /sdk/robots`、`normalizeRobotUrl`、`normalizeWorkflowUrls`、`normalizeUrl`（仅比较用） |
+| `server/src/server.ts` | Express 路由挂载入口 | `app.use('/api', router)` 统一给 api/ 目录加 /api 前缀 |
+| `server/src/api/sdk.ts` | SDK API 路由，统一入口 | `POST /api/sdk/robots`（外部完整路径，内部定义为 `/sdk/robots`，经 `/api` 前缀挂载）、`normalizeRobotUrl`、`normalizeWorkflowUrls`、`normalizeUrl`（仅比较用） |
 | `server/src/sdk/workflowEnricher.ts` | 选择器补全核心 | `enrichWorkflow()`、`generateWorkflowFromPrompt()` |
 | `server/src/sdk/selectorValidator.ts` | 浏览器端选择器验证 | `validateSelector()`、`detectInputType()`、`validateSchemaFields()` |
 | `server/src/utils/auth.ts` | 敏感数据加解密 | `encrypt()` (AES-256-CBC)、`decrypt()` |
