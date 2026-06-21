@@ -538,46 +538,158 @@ const domModeErrorHandler = useCallback(
 
 ---
 
-### 6.8 `dom-mode-enabled` —— 方向容易搞反的事件
+### 6.8 `dom-mode-enabled` —— 双向同名 + 前端自循环事件
 
-**注意**：这是一个 **前端发送、后端监听** 的事件，方向与 `dom-mode-error` 相反。
+**这是代码中最复杂的一个 Socket 事件**：前端既监听也发送，后端只监听但从不发送，形成一个"前端内部广播 + 捎带通知后端"的混合模式。
 
-#### ① 前端发送
+#### 所有监听和发送位置汇总
 
-发送位置：`src/components/browser/BrowserWindow.tsx` L190
+| 操作 | 位置 | 说明 |
+|------|------|------|
+| 前端监听 ① | `src/components/recorder/RightSidePanel.tsx` L154 | `socket.on("dom-mode-enabled", domModeHandler)` |
+| 前端监听 ② | `src/components/browser/BrowserWindow.tsx` L939 | `socket.on("dom-mode-enabled", domModeHandler)` |
+| 前端发送 | `src/components/browser/BrowserWindow.tsx` L190 | `socket?.emit("dom-mode-enabled")`（**不带参数**） |
+| 后端监听 | `server/src/workflow-management/classes/Generator.ts` L204 | `this.socket.on('dom-mode-enabled', ...)` |
+| 后端发送 | **无** | 全仓库无任何 `emit('dom-mode-enabled')` |
 
+#### 前端监听代码对比
+
+**RightSidePanel 监听**（只更新本地状态）：`src/components/recorder/RightSidePanel.tsx` L147-L152
+```typescript
+const domModeHandler = (data: any) => {
+  if (!data.userId || data.userId === id) {   // ← 期望 data 有 userId
+    updateDOMMode(true);
+  }
+};
+socket.on("dom-mode-enabled", domModeHandler);
+```
+
+**BrowserWindow 监听**（更新本地状态 + 再 emit）：`src/components/browser/BrowserWindow.tsx` L186-L194
 ```typescript
 const domModeHandler = useCallback(
     (data: any) => {
-        if (!data.userId || data.userId === user?.id) {
+        if (!data.userId || data.userId === user?.id) {   // ← 期望 data 有 userId
             updateDOMMode(true);
-            socket?.emit("dom-mode-enabled");  // ← 本地状态变更后，通知后端
+            socket?.emit("dom-mode-enabled");  // ← 再发送一次，**不带参数**
         }
     },
     [user?.id, updateDOMMode, socket]
 );
+socket.on("dom-mode-enabled", domModeHandler);
 ```
 
-**触发时机**：前端收到其他来源的 `dom-mode-enabled` 事件后，更新本地状态并再次 emit 到后端（相当于一个确认/同步机制）。
+#### 后端监听代码
 
-#### ② 后端监听
-
-监听位置：`server/src/workflow-management/classes/Generator.ts` L204-L207
-
+`server/src/workflow-management/classes/Generator.ts` L204-L207
 ```typescript
-this.socket.on('dom-mode-enabled', () => {
+this.socket.on('dom-mode-enabled', () => {   // ← 不读取任何参数
   this.isDOMMode = true;
   logger.log('debug', 'Generator: DOM mode enabled');
 });
 ```
 
-**状态变更**：设置 `this.isDOMMode = true`，影响 Generator 的某些行为（如元素选择器生成策略）。
+#### 完整流向图
 
-#### ③ 状态变更与推送
+```
+  初始触发来源不明（后端从不发送）
+           │
+           ▼
+  Socket.IO 命名空间广播（前端 emit）
+    │                     │
+    ▼                     ▼
+RightSidePanel        BrowserWindow
+  收到事件              收到事件
+  updateDOMMode(true)   updateDOMMode(true)
+  (结束)                socket.emit("dom-mode-enabled")  ← 不带参数，再广播一次
+           │                     │
+           └─────────────────────┘
+                     │
+                     ▼
+           Socket.IO 再次广播
+    │                     │                     │
+    ▼                     ▼                     ▼
+RightSidePanel        BrowserWindow          后端 Generator
+  收到事件              收到事件              收到事件
+  updateDOMMode(true)   updateDOMMode(true)   this.isDOMMode = true
+  (结束)                socket.emit(...)      (结束)
+           │                     │
+           └───────────┬─────────┘
+                       │
+                       ▼
+                (潜在无限循环)
+```
 
-**无主动推送**。后端只更新内部状态，不主动 emit 回复。
+#### 存在的问题
 
-> **分类**：正常配对事件（前端 → 后端方向）
+1. **后端从不发送**：没有任何后端代码 emit 此事件，初始触发只能来自前端
+2. **数据格式不匹配**：发送时 `emit("dom-mode-enabled")` 不带参数，但监听时代码检查 `data.userId`
+3. **潜在无限循环**：`!data.userId` 条件永远为 true（因为发送时不带 data），每次收到都会再 emit，理论上会无限循环
+4. **双向同名**：前端既监听也发送同一事件名，容易混淆方向
+
+#### 分类
+
+- **前端 → 后端方向**：正常配对（前端发、后端收）
+- **后端 → 前端方向**：**孤立监听**（后端不发、前端收）
+- **前端内部**：自循环事件
+
+---
+
+### 6.9 `urlChanged` —— 发送格式不一致事件
+
+**后端有两个发送位置，但数据格式不统一；前端有两个监听位置，对格式的期望也不一致。**
+
+#### 后端发送的两种格式
+
+**格式一：纯字符串**（只有 URL 字符串）
+- 发送位置：`server/src/workflow-management/classes/Generator.ts` L1224
+- 发送时机：`onGoto()`、`onGoForward()` 调用 `notifyUrlChange()` 时
+```typescript
+this.socket.emit('urlChanged', url);  // ← 纯字符串，如 "https://example.com"
+```
+
+**格式二：对象格式**（包含 url 和 userId）
+- 发送位置 1：`server/src/browser-management/classes/RemoteBrowser.ts` L265
+- 发送位置 2：`server/src/browser-management/classes/RemoteBrowser.ts` L921
+- 发送时机：页面 `framenavigated` 事件触发、页面初始化完成时
+```typescript
+this.broadcast('urlChanged', {
+    url: currentUrl,
+    userId: this.userId
+});  // ← 对象格式
+```
+
+#### 前端监听的两种期望
+
+**期望一：纯字符串**
+- 监听位置：`src/components/run/RunsTable.tsx` L332
+- 只在运行模式下使用，用于日志输出
+```typescript
+socket.on('urlChanged', (url: string) => {
+  console.log(`URL changed for ${browserId}:`, url);
+});
+```
+
+**期望二：对象格式**
+- 监听位置：`src/components/browser/BrowserNavBar.tsx` L54、L72
+- 用于更新地址栏显示和全局状态
+```typescript
+const handleCurrentUrlChange = useCallback((data: { url: string, userId: string }) => {
+  handleUrlChanged(data.url);       // ← 期望 data.url
+  setRecordingUrl(data.url);        // ← 期望 data.url
+  window.sessionStorage.setItem('recordingUrl', data.url);
+}, [handleUrlChanged, recordingUrl]);
+socket.on('urlChanged', handleCurrentUrlChange);
+```
+
+#### 存在的 Bug
+
+当 `Generator.onGoto()` 或 `onGoForward()` 被调用时：
+1. 后端发送纯字符串 `emit('urlChanged', "https://example.com")`
+2. 前端 `BrowserNavBar` 收到字符串，但期望 `{ url, userId }` 对象
+3. `data.url` 变为 `undefined`（因为字符串没有 `.url` 属性）
+4. 地址栏显示异常，`sessionStorage` 存入 `undefined`
+
+> **分类**：数据格式不一致事件（同一个事件名两种发送格式）
 
 ---
 
@@ -729,7 +841,7 @@ socket.emit('dom:keypress', { selector, key, inputType, ... })
 | `listSelector` | 前端 | RemoteBrowser.initializeSocketListeners | ✅ | 否 |
 | `setPaginationMode` | 前端 | RemoteBrowser.initializeSocketListeners | ✅ | 否 |
 | `testPaginationScroll` | 前端 | RemoteBrowser.onTestPaginationScroll | ✅ | 是（`paginationScrollTestResult`） |
-| `dom-mode-enabled` | BrowserWindow | Generator.initializeDOMListeners | ✅ | 否 |
+| `dom-mode-enabled` | BrowserWindow（收到后转发） | Generator.initializeDOMListeners | ✅ 双向同名，前端也监听 | 否 |
 | `request-refresh` | DOMBrowserRenderer | **无** | ❌ 孤立发送 | 否 |
 
 ### 8.2 后端 → 前端（`socket.emit`）
@@ -750,7 +862,8 @@ socket.emit('dom:keypress', { selector, key, inputType, ... })
 | `showTimePicker` | Generator.onClick | **无** | ❌ 孤立发送 | 显示时间选择器 |
 | `showDateTimePicker` | Generator.onClick | **无** | ❌ 孤立发送 | 显示日期时间选择器 |
 | `decision` | Generator.customAction | InterpretationButtons（运行模式） | ⚠️ 仅运行模式 | 用户决策对话框 |
-| `urlChanged` | Generator、RemoteBrowser | BrowserNavBar、RunsTable | ✅ | URL 同步 |
+| `urlChanged` | Generator.notifyUrlChange（字符串）、RemoteBrowser（对象） | BrowserNavBar（期望对象）、RunsTable（期望字符串） | ✅ 格式不一致 | URL 同步 |
+| `dom-mode-enabled` | **无** | RightSidePanel、BrowserWindow | ❌ 孤立监听 | DOM 模式启用通知 |
 | `newTab` | Generator.notifyOnNewTab | BrowserContent | ✅ | 新标签通知 |
 | `tabHasBeenClosed` | Generator.notifyOnNewTab | BrowserContent | ✅ | 标签关闭通知 |
 | `loaded` | controller.initializeRemoteBrowserForRecording | RecordingPage | ✅ | 浏览器就绪 |
@@ -781,18 +894,27 @@ socket.emit('dom:keypress', { selector, key, inputType, ... })
 
 ### 9.2 孤立监听（前端 on，后端无 emit）
 
-共 **1 个** 事件：
+共 **2 个** 事件：
 
 | 事件 | 前端监听位置 | 推测用途 |
 |------|------------|---------|
 | `listDataExtracted` | `src/components/recorder/RightSidePanel.tsx` L212-L223 | 列表数据实时预览（功能未实现或已废弃） |
+| `dom-mode-enabled` | `src/components/recorder/RightSidePanel.tsx` L154、`src/components/browser/BrowserWindow.tsx` L939 | DOM 模式启用通知（后端从不发送，初始触发来源不明） |
 
 ### 9.3 方向容易混淆的事件
 
 | 事件 | 方向 | 说明 |
 |------|------|------|
-| `dom-mode-enabled` | 前端 → 后端 | 前端通知后端"已进入 DOM 模式"，后端设置 `isDOMMode = true` |
+| `dom-mode-enabled` | 双向同名 | 前端既监听也发送（自循环），后端只监听从不发送；发送不带参数、监听期望 `data.userId`，存在格式不匹配和潜在无限循环 |
 | `dom-mode-error` | 后端 → 前端 | 后端通知前端"浏览器启动失败"，前端退出 DOM 模式 |
+
+### 9.4 数据格式不一致事件
+
+共 **1 个** 事件，同一个事件名有两种发送格式：
+
+| 事件 | 发送格式 A | 发送格式 B | 监听期望 A | 监听期望 B | 存在的 Bug |
+|------|-----------|-----------|-----------|-----------|-----------|
+| `urlChanged` | 纯字符串（Generator.notifyUrlChange） | `{ url, userId }` 对象（RemoteBrowser） | 纯字符串（RunsTable） | `{ url, userId }` 对象（BrowserNavBar） | Generator 发送字符串时，BrowserNavBar 的 `data.url` 为 `undefined`，导致地址栏显示异常 |
 
 ---
 
