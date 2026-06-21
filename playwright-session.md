@@ -161,21 +161,149 @@ updateSocket(socket: Socket): void {
 
 | 方法 | 作用 |
 |------|------|
-| `addRemoteBrowser()` | 直接添加浏览器到池，检查用户槽位上限 |
-| `reserveBrowserSlotAtomic()` | 原子预留槽位（防止竞态），状态为 "reserved" |
-| `upgradeBrowserSlot()` | 将 reserved 槽位升级为 ready（绑定实际 Browser 实例） |
-| `failBrowserSlot()` | 标记槽位失败，清理后删除 |
-| `getRemoteBrowser()` | 获取浏览器实例，reserved/failed 状态返回 undefined |
+| `addRemoteBrowser()` | 直接添加浏览器到池，检查用户槽位上限。**不设置 `status` 字段** |
+| `reserveBrowserSlotAtomic()` | 原子预留槽位（防止竞态），设置 `status: "reserved"`、`browser: null` |
+| `upgradeBrowserSlot()` | 将 reserved 槽位升级为 `status: "ready"`，绑定实际 RemoteBrowser 实例 |
+| `failBrowserSlot()` | 尝试 `switchOff()` 后调用 `deleteRemoteBrowser()`，从池中删除 |
+| `getRemoteBrowser()` | 获取浏览器实例；`status === "reserved"` 或 `"failed"` 时返回 `undefined` |
 
-**槽位状态机**：
+#### 核心纠错：三种会话走不同的池入路径，`status` 字段值完全不同
+
+虽然 `BrowserPoolInfo` 接口定义了 `status?: "reserved" | "initializing" | "ready" | "failed"` 四种状态值，但**代码中 `"initializing"` 从未被任何路径赋值**，它是一个预留但未实现的状态。实际存在的状态流转取决于会话类型：
+
+**① Recording 会话 — 无预留，直接入库，`status` 为 `undefined`**
+
+调用链：[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L26-L104) `initializeRemoteBrowserForRecording()`
 
 ```
-reserved  →  initializing  →  ready
-                │
-                └──→  failed  →  (删除)
+new RemoteBrowser(socket, userId, id, true)
+    ↓
+await browserSession.initialize(userId)          // 同步等待初始化完成
+    ↓
+browserPool.addRemoteBrowser(id, browser, userId, false, "recording")
+    ↓                                             // addRemoteBrowser 不设置 status
+pool[id] = { browser, active: false, userId, state: "recording" }
+    → status: undefined（未设置）
+    → createdAt: undefined（未设置）
+    → browser: RemoteBrowser 实例（非 null）
 ```
 
-**过时清理**：`cleanupStaleBrowserSlots()` 定期清理 reserved/initializing 状态超过 5 分钟的槽位，防止资源泄露。
+- 没有调用 `reserveBrowserSlotAtomic()`，没有 `reserved` 状态
+- 没有调用 `upgradeBrowserSlot()`，没有 `ready` 状态
+- 初始化**先于**入库完成，池中看到时就已经是完整的浏览器实例
+
+**② Run 会话 — 两阶段提交（预留 → 升级），`status` 从 `"reserved"` 到 `"ready"`**
+
+调用链：[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L114-L137) `createRemoteBrowserForRun()` → [initializeBrowserAsync](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L333-L480)
+
+```
+阶段一：预留（同步，立即返回 browserId 给调用方）
+browserPool.reserveBrowserSlotAtomic(id, userId, "run")
+    ↓
+pool[id] = { browser: null, active: false, userId, state: "run",
+             status: "reserved", createdAt: now, lastAccessed: now }
+
+阶段二：异步初始化（initializeBrowserAsync）
+new RemoteBrowser(socket/dummy, userId, id)
+    ↓
+await browserSession.initialize(userId)         // 可能成功或失败
+    ↓
+如果成功：
+browserPool.upgradeBrowserSlot(id, browserSession)
+    ↓
+pool[id].browser = browserSession
+pool[id].status = "ready"                       // reserved → ready
+
+如果失败（任何异常）：
+browserPool.failBrowserSlot(id)
+    ↓
+browser.switchOff?.()                           // 尝试清理（browser 可能为 null）
+deleteRemoteBrowser(id)                         // 从池中删除
+```
+
+- **唯一经过 `reserved → ready` 完整流转**的路径
+- 预留是同步的：调用方立即拿到 `browserId`，但此时浏览器尚未初始化
+- `getRemoteBrowser()` 在 `status === "reserved"` 时返回 `undefined`，确保外部不会拿到未就绪的浏览器
+- 失败路径统一走 `failBrowserSlot()`，而非 `addRemoteBrowser`
+
+**③ Validation 会话 — 无预留，直接入库，`status` 为 `undefined`**
+
+调用链：[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L489-L543) `createRemoteBrowserForValidation()`
+
+```
+new RemoteBrowser(dummySocket, userId, id)
+    ↓
+await browserSession.initialize(userId)         // 同步等待
+    ↓
+browserPool.addRemoteBrowser(id, browser, userId, true, "run")
+    ↓                                             // addRemoteBrowser 不设置 status
+pool[id] = { browser, active: true, userId, state: "run" }
+    → status: undefined（未设置）
+    → createdAt: undefined（未设置）
+    → browser: RemoteBrowser 实例（非 null）
+```
+
+- 与 Recording 会话一样，不走预留/升级流程
+- `active: true`（Recording 是 `false`）
+
+#### 实际槽位状态流转图
+
+```
+┌─ Recording 会话 ─────────────────────────────────────┐
+│  (不存在) ──addRemoteBrowser()──→ status=undefined    │
+│  复用路径：updateSocket()，池条目不变                    │
+└──────────────────────────────────────────────────────┘
+
+┌─ Run 会话 ───────────────────────────────────────────┐
+│  (不存在)                                     │
+│      ↓ reserveBrowserSlotAtomic()                    │
+│  status="reserved", browser=null                     │
+│      ↓ upgradeBrowserSlot()                          │
+│  status="ready", browser=RemoteBrowser               │
+│                                                       │
+│  失败分支：                                           │
+│  status="reserved" ──failBrowserSlot()──→ (删除)      │
+└──────────────────────────────────────────────────────┘
+
+┌─ Validation 会话 ────────────────────────────────────┐
+│  (不存在) ──addRemoteBrowser()──→ status=undefined    │
+└──────────────────────────────────────────────────────┘
+
+注："initializing" 在接口中定义但代码从未赋值，不存在此状态。
+注："failed" 仅在 failBrowserSlot 内部作为日志标记，执行后立即删除，不在池中停留。
+```
+
+#### 复用时的槽位变化
+
+[controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L26-L36) 中，Recording 会话复用路径：
+
+```
+getActiveBrowserIdByState(userId, "recording") 找到 activeId
+    ↓
+browserPool.getRemoteBrowser(activeId)  // status=undefined，不会返回 undefined
+    ↓
+remoteBrowser.updateSocket(socket)      // 仅替换 Socket，池条目不变
+```
+
+- 池中的 `BrowserPoolInfo` 条目**完全不变**（`status`、`browser`、`active` 等字段均不变）
+- `addRemoteBrowser()` 的"同 ID 同用户"更新分支（[BrowserPool.ts#L101-L111](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/classes/BrowserPool.ts#L101-L111)）在复用路径中**不会触发**，因为复用时根本不调用 `addRemoteBrowser()`
+
+#### 过时清理的实际作用范围
+
+[cleanupStaleBrowserSlots](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/classes/BrowserPool.ts#L702-L729) 的清理条件：
+
+```ts
+const isStale = info.status === "reserved" || info.status === "initializing";
+const age = now - (info.createdAt || 0);
+if (isStale && info.browser === null && age > staleThreshold) { ... }
+```
+
+三个条件**同时满足**才会清理：
+1. `status` 为 `"reserved"` 或 `"initializing"` — **Recording/Validation 会话的 `status` 是 `undefined`，不会被清理**
+2. `browser === null` — **Recording/Validation 入库时 browser 已经是实例，也不满足**
+3. `createdAt` 存在且超过 5 分钟 — **Recording/Validation 未设置 `createdAt`，默认为 0，`now - 0` 远超阈值，但被前两个条件挡住**
+
+因此 `cleanupStaleBrowserSlots()` **仅对 Run 会话的预留槽位有效**，用于清理 `initializeBrowserAsync` 中途崩溃导致一直卡在 `reserved` 状态的槽位。
 
 ---
 
@@ -249,10 +377,9 @@ const timeoutHandle = setTimeout(async () => {
 | **isRecordingMode** | `true` | `false` | `false` |
 | **rrweb** | ✅ 启用 | ❌ 跳过 | ❌ 跳过 |
 | **Socket** | 真实 Socket（前端连接） | 真实或 Dummy Socket | Dummy Socket |
-| **槽位策略** | 每用户最多 1 个 recording | 每用户最多 2 个（含 recording） | 通过 addRemoteBrowser 添加 |
-| **复用** | ✅ `updateSocket()` | ❌ 不复用 | ❌ 不复用 |
+| **池入路径** | `addRemoteBrowser()`（status=undefined） | `reserveBrowserSlotAtomic()` → `upgradeBrowserSlot()`（reserved→ready） | `addRemoteBrowser()`（status=undefined） |
+| **复用** | ✅ `updateSocket()`，池条目不变 | ❌ 不复用 | ❌ 不复用 |
 | **超时** | 10 分钟自动销毁 | 无自动超时 | 无自动超时 |
-| **状态流转** | reserved → ready | reserved → ready | 直接添加 |
 | **典型用途** | 用户录制操作流程 | 机器人执行工作流 | SDK 校验任务 |
 
 ---
@@ -286,13 +413,13 @@ BrowserPool
   ├── pool: { [id]: BrowserPoolInfo }
   │       │
   │       └── BrowserPoolInfo
-  │             ├── browser: RemoteBrowser | null
+  │             ├── browser: RemoteBrowser | null     ← Run预留时为null，其余为实例
   │             ├── active: boolean
   │             ├── userId: string
   │             ├── state: "recording" | "run"
-  │             ├── status: "reserved" | "initializing" | "ready" | "failed"
-  │             ├── createdAt: number
-  │             └── lastAccessed: number
+  │             ├── status?: "reserved" | "ready"     ← 仅Run会话设置；Recording/Validation为undefined
+  │             ├── createdAt?: number                 ← 仅Run会话设置（reserveBrowserSlotAtomic）
+  │             └── lastAccessed?: number              ← 仅Run会话设置（reserveBrowserSlotAtomic）
   │
   └── userToBrowserMap: Map<userId, browserId[]>
 
@@ -317,6 +444,6 @@ RemoteBrowser
 3. **引用置空**：finally 块中将 `client`/`currentPage`/`context`/`browser` 置为 null
 4. **命名空间清理**：销毁时断开所有 Socket、移除命名空间监听、从 `_nsps` Map 中删除
 5. **超时自动销毁**：录制会话 10 分钟超时自动触发 `destroyRemoteBrowser()`
-6. **过时槽位清理**：`cleanupStaleBrowserSlots()` 定期清理卡在 reserved/initializing 的槽位
+6. **过时槽位清理**：`cleanupStaleBrowserSlots()` 仅对 Run 会话的 `reserved` 槽位有效（需 status 为 reserved/initializing 且 browser 为 null 且超过 5 分钟），Recording/Validation 的 `status` 为 `undefined` 且 `browser` 非 null，不受此清理影响
 7. **预留锁超时**：`cleanupStaleReservationLocks()` 清理超过 1 分钟的预留锁
 8. **降级兜底**：`connectToRemoteBrowser()` 远程连接失败时降级到本地启动浏览器
