@@ -136,8 +136,8 @@ cookies: (await page.context().cookies([page.url()]))
 流程：
 1. 创建/获取 RemoteBrowser 实例
 2. 调用 `remoteBrowser.initialize(userId)` 创建全新 BrowserContext（干净、无 Cookie）
-3. 从数据库获取录制的 Workflow
-4. （可选）注入用户配置的 Credentials 覆盖录制值
+3. 从数据库获取录制的 Workflow（凭据已在编辑保存时烧录到 workflow 中）
+4. 解释器执行前解密 workflow 中加密的凭据值
 5. 调用解释器 `remoteBrowser.interpreter.interpret()` 执行 Workflow
 6. 执行过程中自然产生登录态 Cookie
 
@@ -174,11 +174,11 @@ export const decrypt = (encryptedText: string): string => {
 };
 ```
 
-### 3.3 额外的 Credentials 覆盖机制
+### 3.3 额外的 Credentials 覆盖机制（编辑保存时生效）
 
-用户可在 Robot 设置页面为特定 CSS 选择器配置凭据值。Run 启动时，这些值会覆盖 Workflow 中录制的原始值。
+用户可在 Robot 设置页面为特定 CSS 选择器配置凭据值。凭据覆盖**发生在编辑配置保存时**（而非 Run 启动时），通过 `handleWorkflowActions()` 将加密后的凭据值替换 Workflow 中对应的 `type`/`press` 动作参数，并将修改后的 workflow 保存到 Robot 表中。Run 执行时直接读取已包含新凭据的 workflow。
 
-**注入位置**：[server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) 的 `handleWorkflowActions()` 函数 L290-L355
+**覆盖位置**：[server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) 的 `handleWorkflowActions()` 函数 L290-L355
 
 核心逻辑：
 
@@ -206,12 +206,14 @@ function handleWorkflowActions(workflow: any[], credentials: Credentials) {
 }
 ```
 
-调用位置：storage.ts L447-L449
+调用位置：[storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts#L387-L389) L387-L389（编辑配置保存接口内）
 
 ```typescript
+// PUT /recordings/:id —— 编辑保存时
 if (credentials) {
   workflow = handleWorkflowActions(workflow, credentials);
 }
+// 然后将修改后的 workflow 保存到 Robot.recording
 ```
 
 ---
@@ -246,8 +248,8 @@ if (credentials) {
 │                                  │                                  │
 │                                  ▼                                  │
 │  ┌───────────────────────────────────────────────────────────────┐  │
-│  │  2. 可选: Credentials 覆盖 (storage.ts handleWorkflowActions)  │  │
-│  │     如果用户为某选择器配置了凭据值，加密后替换原始录制值         │  │
+│  │  2. 从 Robot 表读取最新 recording（含烧录后的凭据）            │  │
+│  │     Robot.findOne() → recording.recording.workflow            │  │
 │  └───────────────────────────────┬───────────────────────────────┘  │
 │                                  │                                  │
 │                                  ▼                                  │
@@ -288,7 +290,7 @@ if (credentials) {
 | 保存 isLogin 标志 | [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/classes/Generator.ts) | L1099 |
 | 创建全新 BrowserContext | [server/src/browser-management/classes/RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/browser-management/classes/RemoteBrowser.ts) | L522 |
 | 执行前解密凭据 | [server/src/workflow-management/classes/Interpreter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/classes/Interpreter.ts) | L28-L33 |
-| Credentials 覆盖注入 | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L290-L355 |
+| 凭据覆盖（编辑保存时生效） | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L290-L355 |
 | 读取 Cookie 用于 where 匹配 | [maxun-core/src/interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/maxun-core/src/interpret.ts) | L271 |
 | Robot 数据模型 | [server/src/models/Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/models/Robot.ts) | - |
 | Run 执行入口 | [server/src/task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts) | processRunExecution() |
@@ -300,7 +302,7 @@ if (credentials) {
 ### 设计特点
 1. **无状态设计**：每次 Run 完全独立，避免了跨任务的登录态污染
 2. **凭据加密**：敏感数据 AES-256-CBC 加密存储，符合安全要求
-3. **灵活覆盖**：支持通过 Credentials 机制在运行时替换录制的凭据值，便于多环境/多账号使用
+3. **凭据覆盖（编辑保存时落库）**：支持通过 Credentials 机制在编辑配置保存时，将加密后的凭据值替换 workflow 中录制的原始值并保存到 Robot 表，便于多环境/多账号使用
 
 ### 当前限制
 1. **每次都需重新登录**：无 Cookie 持久化，Run 开始必须重新执行完整登录流程，增加了执行时间
@@ -823,7 +825,7 @@ Graphile Worker (后台任务)
 ## 十二、更新：设计特点与限制（补充）
 
 ### 新增设计特点
-4. **提前烧录**：凭据在编辑保存时就被加密合并到 Workflow 中，Run 启动时无需额外处理
+4. **凭据覆盖（编辑保存时落库）**：凭据在编辑保存时通过 `handleWorkflowActions()` 加密合并到 Workflow 中并保存到 Robot 表，Run 启动和执行时无需额外处理
 5. **并行初始化**：浏览器初始化与任务入队并行进行，优化了冷启动时间
 6. **队列解耦**：通过 Graphile Worker 队列实现请求处理与实际执行的解耦
 
@@ -1217,12 +1219,11 @@ T2:  解释器 InterpretRecording() 使用内存中的 recording 副本
 ### 设计特点总结（完整）
 1. **无状态设计**：每次 Run 完全独立，避免了跨任务的登录态污染
 2. **凭据加密**：敏感数据 AES-256-CBC 加密存储，符合安全要求
-3. **灵活覆盖**：支持通过 Credentials 机制在运行时替换录制的凭据值，便于多环境/多账号使用
-4. **提前烧录**：凭据在编辑保存时就被加密合并到 Workflow 中，Run 启动时无需额外处理
-5. **并行初始化**：浏览器初始化与任务入队并行进行，优化了冷启动时间
-6. **队列解耦**：通过 Graphile Worker 队列实现请求处理与实际执行的解耦
-7. **配置即最新**：所有执行路径实时读取 Robot 最新配置，确保凭据变更立即生效
-8. **故障自动恢复**：服务崩溃后自动检测孤儿 Run 并重试排队（最多3次）
+3. **凭据覆盖（编辑保存时落库）**：支持通过 Credentials 机制在编辑配置保存时，将加密后的凭据值替换 workflow 中录制的原始值并保存到 Robot 表。Run 启动和执行阶段不再做任何凭据替换操作，直接读取已包含凭据的 workflow
+4. **并行初始化**：浏览器初始化与任务入队并行进行，优化了冷启动时间
+5. **队列解耦**：通过 Graphile Worker 队列实现请求处理与实际执行的解耦
+6. **配置即最新**：所有执行路径实时读取 Robot 最新配置，确保凭据变更对所有待执行 Run 立即生效
+7. **故障自动恢复**：服务崩溃后自动检测孤儿 Run 并重试排队（最多3次）
 
 ### 限制与风险（完整）
 1. **每次都需重新登录**：无 Cookie 持久化，Run 开始必须重新执行完整登录流程，增加了执行时间
