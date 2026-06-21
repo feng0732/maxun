@@ -18,7 +18,7 @@
 | 批量持久化层 | persistenceBuffer | 批次数据 | 内存（队列） |
 | 数据库存储层 | Run 模型 | JSONB 格式 | PostgreSQL |
 | 格式转换层 | output-post-processor | 多格式输出 | 内存 + 数据库 |
-| 导出集成层 | gsheet/airtable/webhook | 目标平台格式 | 外部系统 |
+| 导出集成层 | gsheet/airtable/webhook | 目标平台格式（注：Google Sheets/Airtable 仅非 scrape 触发，Webhook 全触发） | 外部系统 |
 
 ---
 
@@ -345,9 +345,11 @@ MinIO Bucket: maxun-run-screenshots
 
 ### 7.4 调用时机
 
-二进制上传发生在 **Run 执行成功后**，集成更新前：
+二进制上传发生在 **Run 执行成功后**。对于非 scrape 分支，紧接着会触发集成更新（Google Sheets / Airtable）；scrape 分支则在二进制上传和 Webhook 发送后直接结束，不进入集成更新。
 
-代码位置：[task-runner.ts#L461-L462](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L461-L462)
+代码位置（以 task-runner.ts 为例，三套执行层代码一致）：
+- scrape 分支截图上传：[task-runner.ts#L337-L342](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L337-L342)
+- 非 scrape 分支截图上传后调用 triggerIntegrationUpdates：[task-runner.ts#L461-L508](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L461-L508)
 
 ---
 
@@ -355,13 +357,24 @@ MinIO Bucket: maxun-run-screenshots
 
 ### 8.1 触发时机
 
-Run 执行成功（或部分失败但有数据）后，触发集成更新：
+> **重要区分**：Google Sheets 和 Airtable 集成更新 **仅非 scrape 分支触发**；Webhook 在所有分支（含 scrape）都触发。
+
+**Google Sheets / Airtable（仅非 scrape）：**
+
+在 extract/crawl/search 类型机器人执行成功（或部分失败但有数据）后，触发：
 
 ```typescript
 await triggerIntegrationUpdates(plainRun.runId, plainRun.robotMetaId);
 ```
 
-代码位置：[task-runner.ts#L508](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L508)
+代码位置（三套执行层代码一致）：
+- API/record：[record.ts#L1308](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L1308) — 仅在非 scrape 分支的 return 前调用
+- 定时任务/scheduler：[scheduler/index.ts#L755](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L755) — 仅在非 scrape 分支的 return true 前调用
+- 后台运行器/task-runner：[task-runner.ts#L508](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L508) — 仅在非 scrape 分支 return 前调用
+
+scrape 分支在 sendWebhook + destroyRemoteBrowser 后直接 return，始终不进入以上三处 triggerIntegrationUpdates。
+
+**Webhook（全类型触发）：** scrape 和非 scrape 都会在执行成功或失败时调用 `sendWebhook()`，只是 Payload 结构不同。
 
 ### 8.2 Google Sheets 导出
 
@@ -565,7 +578,7 @@ Webhook 发送失败时采用指数退避重试：
 | 层级 | 所在文件 | 核心职责 | **不做什么** |
 |------|----------|----------|-------------|
 | **API 同步等待层** | [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts)、[record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts) | 接收 HTTP 请求、创建 Run 记录、建立 Socket、同步轮询等待结果、格式化 HTTP 响应 | 不直接执行工作流 |
-| **执行层** | [record.ts#L720-L1314](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L720-L1314)、[scheduler/index.ts#L186-L832](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L186-L832)、[task-runner.ts#L130-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L130-L582) | 实际执行浏览器操作、格式转换、截图上传、集成导出、数据库回写、Webhook 发送 | （注意：三套代码高度重复） |
+| **执行层** | [record.ts#L720-L1314](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L720-L1314)、[scheduler/index.ts#L186-L832](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L186-L832)、[task-runner.ts#L130-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L130-L582) | 实际执行浏览器操作、格式转换、截图上传、数据库回写、Webhook 发送；**仅非 scrape 分支** 额外执行 Google Sheets/Airtable 集成导出 | （注意：三套代码高度重复） |
 | **调度层** | [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | 定时轮询 Robot 表、分布式锁认领、计算下次执行时间、派发任务到队列 | 不执行工作流、不处理格式转换 |
 | **后台队列层** | [task-runner.ts#L631-L675](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L631-L675) | Graphile Worker 基础设施：任务队列、并发控制、失败重试、任务分发 | 不包含业务逻辑，只做任务路由 |
 
@@ -589,7 +602,7 @@ Webhook 发送失败时采用指数退避重试：
 
 ### 11.2 三套重复的执行层代码
 
-执行层的核心逻辑（scrape 格式转换、非 scrape 工作流执行、截图上传、集成导出、Webhook）在 **三个文件中重复实现**：
+执行层的核心逻辑（scrape 直接格式转换、非 scrape 工作流执行、截图上传、Webhook）在 **三个文件中重复实现**。注意：**只有非 scrape 分支才包含 Google Sheets / Airtable 集成导出调用**：
 
 | 文件 | 核心函数 | 触发场景 | source 标记 | 最大重试次数 |
 |------|----------|----------|-------------|-------------|
