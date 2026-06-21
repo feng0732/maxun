@@ -733,3 +733,623 @@ private async carryOutSteps(page: Page, steps: What[], currentWorkflow?: Workflo
 6. **回放执行**：深拷贝后按顺序执行每个节点的动作，从待执行队列中移除已完成项
 
 整个流程中，**序列化**是连接内存对象和持久化存储的桥梁，**节点数据**是贯穿始终的核心载体，**回放输入**则是将录制的用户操作还原为浏览器自动化动作的最终目标。
+
+---
+
+## 八、SDK 简化工作流：从输入到保存模型的完整代码链路
+
+除了上述的 GUI 录制方式外，Maxun 还提供了 SDK 接口允许开发者通过编程方式提交简化工作流。这一路径与 GUI 录制在**输入生成阶段**完全不同，但在**序列化保存**和后续阶段共用相同的基础设施。
+
+### 8.1 API 入口：POST /api/sdk/robots
+
+文件位置：[server/src/api/sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts#L163-L326)
+
+SDK 用户提交的是"简化格式"的工作流，API 路由处理以下核心步骤：
+
+```
+SDK 请求体（简化格式）
+    │
+    ▼
+1. 结构校验（meta + workflow 必须存在）
+    │
+    ├── 类型为 'scrape' 时：跳过选择器补全，仅验证 URL
+    │
+    └── 其他类型时：执行 WorkflowEnricher.enrichWorkflow()
+          │
+          ├── 选择器补全 + 验证
+          ├── 输入类型检测 + 加密
+          └── scrapeSchema/scrapeList 字段自动探测
+    │
+    ▼
+2. normalizeWorkflowUrls() - URL 规范化
+    │
+    ▼
+3. 构建 recording_meta（元数据）
+    │
+    ▼
+4. Robot.create() - 写库保存
+```
+
+核心代码（第 182-300 行）：
+
+```typescript
+// 步骤 1：根据类型决定是否需要选择器补全
+if (type === 'scrape') {
+  // scrape 类型：无需补全，直接从 meta.url 获取入口 URL
+  enrichedWorkflow = [];
+  extractedUrl = normalizeRobotUrl((workflowFile.meta as any).url);
+} else {
+  // 其他类型（extract 等）：执行完整的选择器补全流程
+  const enrichResult = await WorkflowEnricher.enrichWorkflow(
+    workflowFile.workflow,  // 用户提交的简化工作流
+    user.id
+  );
+  if (!enrichResult.success) {
+    return res.status(400).json({ error: "Workflow validation failed", details: enrichResult.errors });
+  }
+  enrichedWorkflow = normalizeWorkflowUrls(enrichResult.workflow!);
+  extractedUrl = enrichResult.url ? normalizeRobotUrl(enrichResult.url) : undefined;
+}
+
+// 步骤 2-3：构建元数据
+const robotMeta = {
+  name: workflowFile.meta.name,
+  id: metaId,
+  createdAt: new Date().toISOString(),
+  pairs: enrichedWorkflow.length,
+  type,
+  url: extractedUrl,
+  formats: normalizedFormats,
+  // ... 其他 LLM 相关字段
+};
+
+// 步骤 4：写库保存（与 GUI 录制路径完全相同）
+const robot = await Robot.create({
+  id: robotId,
+  userId: user.id,
+  recording_meta: robotMeta,
+  recording: {
+    workflow: normalizeWorkflowUrls(enrichedWorkflow)  // 再次规范化 URL
+  }
+});
+```
+
+---
+
+### 8.2 选择器补全：WorkflowEnricher.enrichWorkflow
+
+文件位置：[server/src/sdk/workflowEnricher.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L34-L270)
+
+这是 SDK 路径区别于 GUI 录制的**核心差异化步骤**。它启动一个真实浏览器来验证和补全用户提交的简化选择器。
+
+#### 整体执行流程
+
+```
+simplifiedWorkflow（用户提交的简化节点数组）
+    │
+    ▼
+1. 提取入口 URL（遍历 where.url 字段）
+    │
+    ▼
+2. 启动远程浏览器 createRemoteBrowserForValidation()
+    │
+    ▼
+3. 初始化 SelectorValidator → page.goto(url) 打开页面
+    │
+    ▼
+4. 遍历每个简化节点 step：
+    │
+    ├─► 遍历每个动作 action：
+    │     │
+    │     ├── type 动作：输入检测 + 加密
+    │     │     ├── selector 加入 selectors 集合
+    │     │     ├── 值加密 encrypt(value)
+    │     │     └── 自动检测 inputType（或使用用户提供的）
+    │     │
+    │     ├── scrapeSchema 动作：字段选择器补全
+    │     │     ├── 对每个字段调用 validateSchemaFields()
+    │     │     └── 返回 { tag, isShadow, selector, attribute }
+    │     │
+    │     ├── scrapeList 动作：列表自动探测
+    │     │     ├── autoDetectListFields() 自动识别子字段
+    │     │     └── autoDetectPagination() 自动识别分页
+    │     │
+    │     └── 其他动作（click 等）：原样保留
+    │
+    └─► 将收集的 selectors 写入 enrichedStep.where.selectors
+    │
+    ▼
+5. 关闭浏览器，返回 enrichedWorkflow
+```
+
+#### 8.2.1 type 动作：输入检测 + 加密
+
+代码位置：[workflowEnricher.ts#L81-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L81-L118)
+
+```typescript
+if (action.action === 'type') {
+  const [selector, value, providedInputType] = action.args;
+
+  selectors.push(selector);  // 收集选择器到 where.selectors
+
+  // 关键：值加密（与 GUI 录制路径使用相同的 encrypt 函数）
+  const encryptedValue = encrypt(value);
+
+  if (!providedInputType) {
+    // 自动检测输入框类型（text, password, email 等）
+    const inputType = await validator.detectInputType(selector);
+    enrichedStep.what.push({
+      ...action,
+      args: [selector, encryptedValue, inputType]  // 补全第三参数
+    });
+  } else {
+    enrichedStep.what.push({
+      ...action,
+      args: [selector, encryptedValue, providedInputType]
+    });
+  }
+
+  // 自动追加 waitForLoadState 动作（与 GUI 录制路径一致）
+  enrichedStep.what.push({ action: 'waitForLoadState', args: ['networkidle'] });
+}
+```
+
+**与 GUI 录制对比**：
+- GUI 录制：逐键 `press` → 优化为 `type`（带加密值）
+- SDK 路径：直接 `type` → 立即加密（跳过逐键录制和优化阶段）
+
+最终存储格式**完全一致**，均为 `{ action: 'type', args: [selector, encryptedValue, inputType] }`。
+
+#### 8.2.2 scrapeSchema 动作：字段选择器补全
+
+代码位置：[workflowEnricher.ts#L126-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L126-L164)
+
+用户可能只提交了简单的字段名-选择器映射：
+```json
+{
+  "action": "scrapeSchema",
+  "args": [{
+    "title": "h1.product-title",
+    "price": "//div[@class='price']"
+  }]
+}
+```
+
+经过 `validateSchemaFields()` 补全后，每个字段获得额外的元数据：
+```json
+{
+  "action": "scrapeSchema",
+  "actionId": "text-uuid",
+  "args": [{
+    "title": {
+      "tag": "H1",
+      "isShadow": false,
+      "selector": "h1.product-title",
+      "attribute": "innerText"
+    },
+    "price": {
+      "tag": "DIV",
+      "isShadow": false,
+      "selector": "//div[@class='price']",
+      "attribute": "innerText"
+    }
+  }]
+}
+```
+
+验证由 [SelectorValidator.validateSelector()](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/selectorValidator.ts#L54-L108) 完成，包括：
+- 检查选择器是否匹配到元素（`count() !== 0`）
+- 获取元素的 `tagName`（H1, DIV, A 等）
+- 检查元素是否在 Shadow DOM 中（`isShadow`）
+- 确认属性类型（默认 `innerText`，可为 `href`, `src` 等）
+
+#### 8.2.3 scrapeList 动作：列表自动探测
+
+代码位置：[workflowEnricher.ts#L166-L232](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L166-L232)
+
+用户可能只提交了列表容器选择器（itemSelector），系统自动：
+1. **autoDetectListFields()**：遍历列表项的子元素，自动识别标题、价格、图片、链接等常见字段
+2. **autoDetectPagination()**：检测是否存在下一页按钮，识别分页类型（`none`/`click`/`scroll`/`url_param`）
+
+补全后的 `scrapeList` 动作：
+```json
+{
+  "action": "scrapeList",
+  "actionId": "list-uuid",
+  "args": [{
+    "fields": { "Title": {...}, "Price": {...}, "Image": {...} },
+    "listSelector": "div.product-card",
+    "pagination": { "type": "click", "selector": "button.next" },
+    "limit": 100
+  }]
+}
+```
+
+---
+
+### 8.3 输入加密：AES-256-CBC 对称加密
+
+文件位置：[server/src/utils/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/utils/auth.ts#L26-L61)
+
+SDK 路径与 GUI 录制路径使用**完全相同的加密函数**，确保回放时解密逻辑的一致性。
+
+#### encrypt 实现
+
+```typescript
+export const encrypt = (text: string): string => {
+  const ivLength = 16;
+  const iv = crypto.randomBytes(ivLength);           // 随机 16 字节 IV
+  const algorithm = 'aes-256-cbc';
+
+  // 从环境变量 ENCRYPTION_KEY 获取密钥（64 位十六进制 = 256 位）
+  let key = getEnvVariable('ENCRYPTION_KEY');
+  if (!key || key.length !== 64) {
+    key = crypto.randomBytes(32).toString('hex');   // 生成临时密钥（警告）
+  }
+  const keyBuffer = Buffer.from(key, 'hex');
+
+  const cipher = crypto.createCipheriv(algorithm, keyBuffer, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+
+  // 输出格式: "IV(hex):密文(hex)" 拼接
+  return `${iv.toString('hex')}:${encrypted}`;
+};
+```
+
+**加密特征**：
+- **算法**：AES-256-CBC（256 位密钥，密码分组链接模式）
+- **IV 处理**：每次加密生成随机 16 字节 IV，拼接在密文前（相同明文 → 不同密文）
+- **密钥来源**：环境变量 `ENCRYPTION_KEY`，缺失时临时生成（警告：重启后无法解密旧数据）
+- **输出格式**：`ivHex:ciphertextHex`，用冒号分隔
+
+#### decrypt 实现（回放时调用）
+
+```typescript
+export const decrypt = (encryptedText: string): string => {
+  const [iv, encrypted] = encryptedText.split(':');  // 拆分 IV 和密文
+  const keyBuffer = Buffer.from(getEnvVariable('ENCRYPTION_KEY'), 'hex');
+
+  const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, Buffer.from(iv, 'hex'));
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+};
+```
+
+**加密发生的三个位置**：
+
+| 位置 | 场景 | 代码位置 |
+|-----|------|---------|
+| 1 | SDK `type` 动作补全时 | [workflowEnricher.ts#L93](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L93) |
+| 2 | GUI 录制键盘输入时 | [Generator.ts#L481](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L481) |
+| 3 | GUI 优化后生成 type 动作时 | [Generator.ts#L1487](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L1487) |
+
+**解密发生的位置**：
+- [Interpreter.ts#processWorkflow](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Interpreter.ts#L14-L48)：所有工作流回放前统一解密
+
+---
+
+### 8.4 URL 规范化：三个层次的处理
+
+URL 规范化在 SDK 路径中被调用了**多次**，确保 URL 格式统一，避免因格式差异导致的 URL 匹配失败。
+
+#### 8.4.1 normalizeRobotUrl：单 URL 规范化
+
+文件位置：[sdk.ts#L67-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts#L67-L75)
+
+```typescript
+const normalizeRobotUrl = (rawUrl: string): string => {
+  const normalizedUrl = new URL(rawUrl.trim());
+  if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
+    throw new Error('Invalid URL protocol');
+  }
+  // 通过 searchParams.toString() 标准化查询参数顺序/编码
+  normalizedUrl.search = normalizedUrl.searchParams.toString();
+  return normalizedUrl.toString();
+};
+```
+
+**处理内容**：
+1. 去除前后空白字符
+2. 协议校验（仅允许 http/https）
+3. 重新序列化查询参数（统一参数顺序和 URL 编码）
+
+#### 8.4.2 normalizeWorkflowUrls：遍历工作流规范化
+
+文件位置：[sdk.ts#L77-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts#L77-L125)
+
+遍历工作流的三个位置：
+1. **pair.where.url**：节点的执行条件 URL
+2. **goto 动作的 args[0]**：页面跳转 URL
+3. **scrape/crawl 动作的 args[0].url**：爬取入口 URL
+
+```typescript
+const normalizeWorkflowUrls = (workflow: any[] = []): any[] =>
+  workflow.map((pair: any) => ({
+    ...pair,
+    where: {
+      ...pair.where,
+      url: typeof pair.where.url === 'string' && pair.where.url !== 'about:blank'
+        ? normalizeRobotUrl(pair.where.url)
+        : pair.where.url
+    },
+    what: pair.what.map((action: any) => {
+      if (action.action === 'goto' && action.args?.[0] !== 'about:blank') {
+        return { ...action, args: [normalizeRobotUrl(action.args[0]), ...action.args.slice(1)] };
+      }
+      if ((action.action === 'scrape' || action.action === 'crawl') && action.args?.[0]?.url) {
+        return {
+          ...action,
+          args: [{ ...action.args[0], url: normalizeRobotUrl(action.args[0].url) }, ...action.args.slice(1)]
+        };
+      }
+      return action;
+    })
+  }));
+```
+
+#### 8.4.3 SDK 路径中的规范化调用时序
+
+```
+enrichWorkflow 完成
+    │
+    ├─► enrichedWorkflow = normalizeWorkflowUrls(enrichResult.workflow)
+    │     第一次：对 enricher 返回的工作流规范化
+    │
+    ▼
+extractUrl = normalizeRobotUrl(enrichResult.url)
+    │     第二次：对入口 URL 规范化
+    │
+    ▼
+写入 Robot.create 时:
+    recording.workflow = normalizeWorkflowUrls(enrichedWorkflow)
+          第三次：写库前再次规范化（双重保险）
+```
+
+**为什么多次规范化？**
+- `enrichWorkflow` 内部使用浏览器导航，可能引入新的 URL
+- 写库前再次规范化确保不因后续处理逻辑引入格式差异
+- `'about:blank'` 特殊处理：空页标识不做规范化（作为起始标记保留）
+
+---
+
+### 8.5 写库保存：Robot.create 的最终写入
+
+文件位置：[server/src/models/Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts)
+
+SDK 路径与 GUI 录制路径在**写库阶段完全一致**，均通过 Sequelize 的 `Robot.create()` 写入 PostgreSQL。
+
+#### 写入数据结构
+
+```typescript
+Robot.create({
+  id: robotId,                    // UUID 主键
+  userId: user.id,                // 关联用户
+
+  // --- JSONB 字段 1: 元数据 ---
+  recording_meta: {
+    name: "My Robot",             // 用户定义的名称
+    id: metaId,                   // 业务 ID（与 Robot.id 不同）
+    createdAt: "2026-06-21T...",
+    updatedAt: "2026-06-21T...",
+    pairs: 3,                     // 工作流节点数
+    params: [],                   // 提取出的参数占位符
+    type: "extract",              // extract / scrape / crawl / search
+    url: "https://example.com",   // 入口 URL
+    formats: ["markdown", "json"],// 输出格式
+    isLLM: false,                 // 是否 LLM 生成
+    // ... LLM 配置字段（可选）
+  },
+
+  // --- JSONB 字段 2: 工作流本体 ---
+  recording: {
+    workflow: [                   // WhereWhatPair[] 数组
+      {
+        where: { url: "about:blank", selectors: [] },
+        what: [
+          { action: "goto", args: ["https://example.com"] },
+          { action: "waitForLoadState", args: ["networkidle"] }
+        ]
+      },
+      {
+        where: {
+          url: "https://example.com",
+          selectors: ["input.search"]
+        },
+        what: [
+          { action: "type", args: ["input.search", "ivHex:encryptedValue", "text"] },
+          { action: "waitForLoadState", args: ["networkidle"] },
+          { action: "scrapeList", actionId: "list-uuid", args: [{
+            fields: { ... }, listSelector: "...", pagination: { ... }
+          }]}
+        ]
+      }
+    ]
+  },
+
+  // --- 其他关联字段 ---
+  google_sheet_email: null,
+  schedule: null,
+  webhooks: null,
+  // ...
+})
+```
+
+#### Sequelize JSONB 序列化过程
+
+```
+JavaScript 对象 (recording_meta, recording)
+    │
+    ▼  Sequelize DataTypes.JSONB 处理器
+JSON.stringify(obj) 自动序列化
+    │
+    ▼  PostgreSQL 驱动
+转换为 PostgreSQL JSONB 二进制格式
+    │
+    ▼
+写入数据库列
+```
+
+**关键点**：应用层代码**不需要显式调用 `JSON.stringify()`**。Sequelize 的 `DataTypes.JSONB` 类型定义会在保存时自动完成序列化，读取时自动完成 `JSON.parse()` 反序列化。
+
+#### 与 GUI 录制路径的写入对比
+
+| 对比项 | GUI 录制路径 | SDK 简化路径 |
+|-------|------------|------------|
+| 入口 | `Generator.saveNewWorkflow()` | `POST /api/sdk/robots` |
+| 节点生成 | 实时生成（Socket 事件驱动） | 一次性提交（HTTP 请求体） |
+| 选择器来源 | 浏览器自动录制 | 用户提交 + 浏览器补全（enrichWorkflow） |
+| 输入处理 | 逐键 press → 优化为 type | 直接 type → 加密补全 inputType |
+| URL 规范化 | `normalizeWorkflowUrls()` 一次 | 多次调用 normalizeRobotUrl/Urls |
+| 写库函数 | `Robot.create()` | `Robot.create()` |
+| 存储格式 | **完全一致** | **完全一致** |
+| 回放加载 | **完全一致** | **完全一致** |
+| 执行引擎 | **完全一致** | **完全一致** |
+
+---
+
+### 8.6 SDK 简化工作流的完整关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      SDK 提交：简化工作流输入                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  POST /api/sdk/robots                                                   │
+│  Body: {                                                                │
+│    meta: { name: "...", type: "extract", ... },                         │
+│    workflow: [                                                          │
+│      { where: { url: "..." }, what: [                                   │
+│        { action: "type", args: ["#search", "keyword"] },   ← 简化格式    │
+│        { action: "scrapeList", args: [{ itemSelector: "..." }] }        │
+│      ]}                                                                 │
+│    ]                                                                    │
+│  }                                                                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 步骤 1：WorkflowEnricher 选择器补全                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. 启动浏览器：createRemoteBrowserForValidation()                      │
+│  2. 导航到 URL：page.goto(url)                                          │
+│  3. 遍历每个动作进行补全：                                                │
+│                                                                         │
+│  ┌─ type 动作 ──────────────────────────────────────────────┐           │
+│  │  selector → 加入 where.selectors 集合                    │           │
+│  │  value    → encrypt(value) 加密                          │           │
+│  │             （AES-256-CBC，随机 IV）                      │           │
+│  │  inputType→ validator.detectInputType() 自动检测          │           │
+│  │             （或使用用户提供的第三个参数）                  │           │
+│  │  自动追加: waitForLoadState(networkidle)                 │           │
+│  └───────────────────────────────────────────────────────────┘           │
+│                                                                         │
+│  ┌─ scrapeSchema 动作 ──────────────────────────────────────┐           │
+│  │  每个字段 → validateSelector() 验证                       │           │
+│  │    补全: { tag, isShadow, selector, attribute }          │           │
+│  │    选择器 → 加入 where.selectors                          │           │
+│  └───────────────────────────────────────────────────────────┘           │
+│                                                                         │
+│  ┌─ scrapeList 动作 ────────────────────────────────────────┐           │
+│  │  autoDetectListFields() → 自动识别子字段                  │           │
+│  │  autoDetectPagination() → 自动识别分页                    │           │
+│  └───────────────────────────────────────────────────────────┘           │
+│                                                                         │
+│  enrichedStep.where.selectors = [收集的选择器数组]                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   步骤 2：URL 规范化（多次调用）                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  第 1 次: normalizeWorkflowUrls(enrichedWorkflow)                       │
+│    ├─ pair.where.url          → 去除尾斜杠，统一 query 编码              │
+│    ├─ goto.args[0]            → 去除尾斜杠，统一 query 编码              │
+│    └─ scrape/crawl.args[0].url → 去除尾斜杠，统一 query 编码             │
+│                                                                         │
+│  第 2 次: normalizeRobotUrl(enrichResult.url)  ← 入口 URL               │
+│                                                                         │
+│  第 3 次: normalizeWorkflowUrls(enrichedWorkflow) ← 写库前双重保险       │
+│                                                                         │
+│  特殊规则: "about:blank" → 跳过规范化（起始标记）                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   步骤 3：构建 recording_meta 元数据                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  robotMeta = {                                                          │
+│    name, id(uuid), createdAt, updatedAt,                                │
+│    pairs: enrichedWorkflow.length,                                      │
+│    type, url(规范化后的), formats,                                      │
+│    isLLM, promptInstructions, ...(LLM 配置)                             │
+│  }                                                                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     步骤 4：Robot.create 写库保存                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Robot.create({                                                         │
+│    id: uuid(),                                                          │
+│    userId: user.id,                                                     │
+│    recording_meta: robotMeta,    ← DataTypes.JSONB 自动序列化            │
+│    recording: {                   ← DataTypes.JSONB 自动序列化            │
+│      workflow: normalizeWorkflowUrls(enrichedWorkflow)                  │
+│    }                                                                    │
+│    ...其他字段                                                           │
+│  })                                                                     │
+│         │                                                               │
+│         ▼  Sequelize ORM 层                                            │
+│  JSON.stringify(recording_meta) → PostgreSQL JSONB                      │
+│  JSON.stringify(recording)      → PostgreSQL JSONB                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     后续：与 GUI 录制路径完全共用                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  • 从数据库加载：Robot.findOne() → Sequelize 自动反序列化                │
+│  • 回放前：processWorkflow() 解密 AES 加密的 type/press 值              │
+│  • 预处理：Preprocessor.initWorkflow() 转换 $regex/$param              │
+│  • 执行：Interpreter.run() → runLoop() → carryOutSteps()                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 8.7 关键代码文件索引（SDK 路径）
+
+| 文件 | 主要职责 | 关键函数/方法 |
+|-----|---------|-------------|
+| [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts) | SDK API 路由，统一入口 | `POST /sdk/robots`、`normalizeRobotUrl`、`normalizeWorkflowUrls` |
+| [workflowEnricher.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts) | 选择器补全核心 | `enrichWorkflow()`、`generateWorkflowFromPrompt()` |
+| [selectorValidator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/selectorValidator.ts) | 浏览器端选择器验证 | `validateSelector()`、`detectInputType()`、`validateSchemaFields()` |
+| [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/utils/auth.ts) | 敏感数据加解密 | `encrypt()` (AES-256-CBC)、`decrypt()` |
+| [Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts) | 数据库模型（共享） | `Robot.init()` 中 JSONB 字段定义 |
+
+---
+
+### 8.8 SDK 路径核心结论
+
+1. **两种路径，统一存储**：SDK 简化工作流经过补全、加密、规范化后，写入数据库的 `WhereWhatPair` 结构与 GUI 录制路径**完全一致**
+
+2. **选择器补全的本质**：启动真实浏览器验证用户提交的选择器，补全 `tag`、`isShadow`、`attribute` 等元数据，并将选择器集合写入 `where.selectors` 字段
+
+3. **加密一致性**：SDK 的 `type` 动作直接调用 `encrypt()`，跳过了 GUI 的逐键 `press` → 优化为 `type` 的过程，但加密算法和存储格式与 GUI 路径完全相同
+
+4. **URL 规范化的三道保险**：enricher 输出后一次、入口 URL 单独一次、写库前再次一次，确保 `where.url`、`goto` 动作、`scrape/crawl` 动作三处的 URL 格式统一
+
+5. **后续阶段零差异**：一旦写入数据库，加载、预处理、回放执行的所有步骤，SDK 路径与 GUI 录制路径**完全共用相同的代码**
