@@ -923,33 +923,268 @@ browser.newContext({ proxy: { server, username, password } })  ← 真正生效
 
 ---
 
-## 9. 关键设计缺陷分析
+## 9. 文档类任务：正常执行 vs 崩溃恢复排队执行的差异
 
-### 9.1 无代理轮换 / IP 池机制
+### 9.1 正常执行路径（无需浏览器、无需代理）
+
+文档类机器人 (`doc-extract` / `doc-parse`) 正常执行时**完全不接触浏览器和代理**。
+
+**入口一：调度触发** — `server/src/workflow-management/scheduler/index.ts` L42-L121
+
+```
+createWorkflowAndStoreMetadata(id, userId)
+  ├─ getDecryptedProxyConfig(userId)          ← 获取代理配置，仅赋值给 proxyOptions 变量
+  ├─ isDocRobot = true
+  ├─ browserId = uuid()                       ← 生成假 ID，不创建真实浏览器
+  ├─ Run.create({ browserId, interpreterSettings: { robotType } })
+  └─ addJob(EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 })
+```
+
+**入口二：API 运行** — `server/src/api/record.ts` L552-L637
+
+与调度路径相同：假 browserId，不创建真实浏览器，直接入队。
+
+**入口三：专用文档端点** — `server/src/routes/storage.ts` L2031-L2051 / L2087-L2107
+
+```
+POST /recordings/doc-extract 或 POST /recordings/doc-parse
+  ├─ browserId = uuid()                       ← 假 ID
+  ├─ Run.create({ interpreterSettings: { robotType: 'doc-extract' } })
+  └─ addJob(EXECUTE_RUN, { userId, runId, browserId: runId }, { maxAttempts: 1 })
+                                                    ↑ 注意：browserId = runId，不是真实的
+```
+
+**执行阶段** — `server/src/task-runner.ts` L130-L179
+
+```
+processRunExecution(data)
+  ├─ plainRun.interpreterSettings.robotType === 'doc-extract'
+  │   └─ executeDocumentRun(recording, run, data.userId, serverIo)
+  │       ├─ getDocumentFromMinio(documentKey)     ← 从 MinIO 获取 PDF
+  │       ├─ DocumentInterpreter.extractData(...)   ← LLM 提取
+  │       ├─ run.update({ status: 'success/failed' })
+  │       ├─ serverIo.emit('run-completed', ...)
+  │       └─ sendWebhook(...)
+  │       ❌ 无浏览器创建、无代理应用、无浏览器清理
+  │       return
+  │
+  └─ plainRun.interpreterSettings.robotType === 'doc-parse'
+      └─ executeDocumentParseRun(recording, run, data.userId, serverIo)
+          ├─ getDocumentFromMinio(documentKey)     ← 从 MinIO 获取 PDF
+          ├─ DocumentInterpreter.parse(...)         ← 解析
+          ├─ run.update({ status: 'success/failed' })
+          ├─ serverIo.emit('run-completed', ...)
+          └─ sendWebhook(...)
+          ❌ 无浏览器创建、无代理应用、无浏览器清理
+          return
+```
+
+### 9.2 崩溃恢复排队执行路径（会错误创建浏览器 + 初始化代理）
+
+崩溃恢复流程中，**`processQueuedRuns` 不区分文档任务和浏览器任务**，一律创建浏览器。
+
+**恢复流程** — `server/src/routes/storage.ts` L1572-L1643 + L1493-L1566
+
+```
+服务崩溃 → 服务重启
+  ├─ recoverOrphanedRuns()
+  │   ├─ 查找 status in ['running', 'scheduled'] 的运行
+  │   ├─ browserPool.getRemoteBrowser(runData.browserId)
+  │   │   ├─ 文档任务的 browserId 是 uuid() 假 ID → 必然找不到浏览器
+  │   │   └─ 假 ID 不在池中 → 视为孤儿
+  │   └─ retryCount < 3 → status='queued', browserId=undefined
+  │
+  └─ processQueuedRuns() 每5秒轮询
+      ├─ 找到 queued 状态的文档运行
+      ├─ const userId = queuedRun.runByUserId     ← ⚠️ 可能是 null（见 9.3 节）
+      ├─ browserPool.hasAvailableBrowserSlots(userId, "run")
+      │   └─ 不检查 robotType，检查是否有浏览器槽位
+      ├─ const newBrowserId = createRemoteBrowserForRun(userId)
+      │   ├─ reserveBrowserSlotAtomic(id, userId, "run")
+      │   ├─ initializeBrowserAsync(id, userId)
+      │   │   ├─ connectToRemoteBrowser()          ← L1: 连接浏览器（3次重试+本地回退）
+      │   │   ├─ getDecryptedProxyConfig(userId)   ← L2: 读取并应用代理配置
+      │   │   └─ browser.newContext({ proxy })      ← 代理生效到 BrowserContext
+      │   └─ 浏览器池中创建了一个带代理的真实浏览器实例
+      ├─ queuedRun.update({ status: 'running', browserId: newBrowserId })
+      └─ addJob(EXECUTE_RUN, { userId, runId, browserId: newBrowserId })
+          └─ processRunExecution() 被触发
+              └─ robotType === 'doc-extract'
+                  └─ executeDocumentRun() → return
+                      ❌ 浏览器已创建但从未使用，也从未被清理
+```
+
+### 9.3 正常 vs 恢复路径差异对比
+
+| 维度 | 正常执行 | 崩溃恢复排队执行 |
+|------|---------|----------------|
+| **browserId 来源** | `uuid()` 假 ID | `createRemoteBrowserForRun()` 创建真实浏览器 |
+| **是否创建浏览器** | ❌ 否 | ✅ **是（不必要）** |
+| **是否应用代理** | ❌ 否 | ✅ **是（代理初始化到 BrowserContext）** |
+| **代理读取** | `getDecryptedProxyConfig()` 被调用但结果仅赋值给变量 | `getDecryptedProxyConfig()` 被调用，代理注入到 `context.proxy` |
+| **浏览器使用** | 不使用 | 不使用（文档分支提前 return） |
+| **浏览器清理** | 不需要 | ❌ **不会清理**，槽位泄漏 |
+| **浏览器槽位占用** | 不占用 | ⚠️ **占用一个槽位**（每个用户上限2个） |
+| **`runByUserId`** | API 路径有值；**调度路径缺失** | 依赖 `queuedRun.runByUserId`，调度路径为 null |
+| **网络请求** | MinIO + LLM，走宿主机默认网络 | 同左，代理与文档处理无关 |
+
+### 9.4 文档分支提前返回后的资源处理问题
+
+文档分支 `return` 后，以下资源**无人管理**：
+
+**问题一：崩溃恢复创建的浏览器实例泄漏**
+
+```
+processQueuedRuns() 创建浏览器 → 浏览器池中 reserved → initializing → ready
+  ↓
+processRunExecution() 文档分支 return
+  ↓
+浏览器实例在池中永远处于 ready 状态，无人使用，无人销毁
+  ↓
+占用用户的浏览器槽位（上限2个），可能导致后续运行无法创建新浏览器
+  ↓
+只能等待 cleanupStaleBrowserSlots() 在 5 分钟后清理
+  但 cleanupStaleBrowserSlots 只清理 status=reserved/initializing 且 browser=null 的槽位
+  文档任务创建的浏览器已经 ready 且 browser≠null → ❌ 不会被清理！
+```
+
+**问题二：代理配置已应用但无人使用**
+
+崩溃恢复时，代理被初始化到 BrowserContext。但文档任务不会访问任何网页，代理连接处于空闲状态。如果代理服务器有连接数限制，这会**白白占用一个代理连接名额**。
+
+**问题三：文档执行函数内的资源清理**
+
+`executeDocumentRun()` 和 `executeDocumentParseRun()` 自身的资源管理是正确的：
+- 成功时：更新 Run 状态 → emit socket → send webhook
+- 失败时：更新 Run 状态为 failed → emit socket（失败事件）
+- 没有需要清理的浏览器资源（正常路径本来就没创建浏览器）
+
+但在崩溃恢复路径中，这些函数**不知道外部已经创建了浏览器**，所以不会清理。
+
+### 9.5 用户标识来源风险：`runByUserId` 在调度路径中缺失
+
+**核心风险**：调度器创建的运行记录**没有设置 `runByUserId`**，但 `processQueuedRuns` 依赖这个字段。
+
+**各入口 `runByUserId` 赋值情况**：
+
+| 入口 | 文件 | `runByUserId` 赋值 |
+|------|------|-------------------|
+| 调度触发 | `scheduler/index.ts` L77-L92 | ❌ **未设置**（`Run.create` 无此字段） |
+| 手动运行(有槽位) | `storage.ts` L1038-L1052 | ✅ `req.user.id` |
+| 手动运行(排队) | `storage.ts` L1103-L1117 | ✅ `req.user.id` |
+| API 运行 | `record.ts` L589-L608 | ✅ `userId`（从 `req.user.id` 传入） |
+| 文档提取端点 | `storage.ts` L2031-L2045 | ✅ `req.user.id` |
+| 文档解析端点 | `storage.ts` L2087-L2101 | ✅ `req.user.id` |
+
+**风险链路**：
+
+```
+调度触发 → Run.create (无 runByUserId) → 服务崩溃 → recoverOrphanedRuns()
+  → status='queued' → processQueuedRuns()
+  → const userId = queuedRun.runByUserId     ← undefined / null
+  → browserPool.hasAvailableBrowserSlots(undefined, "run")
+      ↓
+  如果 hasAvailableBrowserSlots 不校验 userId：
+    → createRemoteBrowserForRun(undefined)   ← L115: throw Error('userId is required')
+    → 浏览器创建失败 → 运行被标记为 failed
+  如果 hasAvailableBrowserSlots 校验 userId 为空返回 false：
+    → 永远无法获得浏览器槽位
+    → 文档任务永远停在 queued 状态
+    → 但文档任务根本不需要浏览器！
+```
+
+**影响**：
+1. 调度触发的运行崩溃恢复后，`runByUserId` 缺失导致 `processQueuedRuns` 行为异常
+2. 即使 `runByUserId` 正确，`processQueuedRuns` 也会为文档任务不必要地创建浏览器
+3. 两个问题叠加：调度触发的文档任务崩溃恢复后，**要么浏览器创建失败（userId=undefined），要么创建成功但永远不用（浏览器槽位泄漏）**
+
+### 9.6 完整流程对比图
+
+```
+═══════════════════════════════════════════════════════
+正常执行（文档任务）
+═══════════════════════════════════════════════════════
+
+创建 Run (browserId=uuid假ID)
+  ↓
+addJob(EXECUTE_RUN)
+  ↓
+processRunExecution()
+  ├─ robotType === 'doc-extract'
+  │   └─ executeDocumentRun()
+  │       ├─ MinIO 获取 PDF
+  │       ├─ LLM 提取数据
+  │       ├─ 更新 Run 状态
+  │       └─ return ✅ 完成
+  └─ robotType === 'doc-parse'
+      └─ executeDocumentParseRun()
+          ├─ MinIO 获取 PDF
+          ├─ 解析数据
+          ├─ 更新 Run 状态
+          └─ return ✅ 完成
+
+浏览器: 0个  |  代理应用: 0次  |  槽位占用: 0
+
+
+═══════════════════════════════════════════════════════
+崩溃恢复排队执行（文档任务）
+═══════════════════════════════════════════════════════
+
+服务崩溃 → 重启
+  ↓
+recoverOrphanedRuns()
+  ├─ 假 browserId 在池中不存在 → 视为孤儿
+  └─ status='queued', browserId=undefined
+  ↓
+processQueuedRuns()
+  ├─ userId = queuedRun.runByUserId  ← ⚠️ 调度路径可能为 null
+  ├─ hasAvailableBrowserSlots(userId)
+  ├─ createRemoteBrowserForRun(userId)
+  │   ├─ 连接远程浏览器（3次重试 + 本地回退）
+  │   ├─ getDecryptedProxyConfig(userId)  ← 读取代理
+  │   └─ newContext({ proxy })            ← 应用代理
+  ├─ queuedRun.update({ browserId: newBrowserId })
+  └─ addJob(EXECUTE_RUN, { browserId: newBrowserId })
+      ↓
+processRunExecution()
+  └─ robotType === 'doc-extract'
+      └─ executeDocumentRun() → return
+          ❌ 浏览器已创建 + 代理已应用，但从未使用
+          ❌ 浏览器实例未被清理，槽位泄漏
+          ❌ 代理连接白白占用
+
+浏览器: 1个(泄漏)  |  代理应用: 1次(无用)  |  槽位占用: 1个(浪费)
+```
+
+---
+
+## 10. 关键设计缺陷分析
+
+### 10.1 无代理轮换 / IP 池机制
 
 - **问题**：每个用户只能配置一个代理，没有多代理池
 - **影响**：无法实现 IP 轮换，容易被目标网站封禁
 - **代码证据**：User 模型只有单组代理字段，没有 Proxy 或 ProxyPool 表
 
-### 9.2 无运行时代理切换
+### 10.2 无运行时代理切换
 
 - **问题**：代理仅在 BrowserContext 创建时应用，运行中无法切换
 - **影响**：遇到代理失败时只能重试同一个代理，无法自动切换到备用代理
 - **代码证据**：`RemoteBrowser` 没有提供 `changeProxy()` 方法
 
-### 9.3 所有重试都不切换代理
+### 10.3 所有重试都不切换代理
 
 - **问题**：四级重试机制（连接重试、初始化重试、运行重试、任务队列重试）都使用同一个代理
 - **影响**：代理本身故障时，重试多少次都不会成功
 - **代码证据**：`getDecryptedProxyConfig(userId)` 始终返回同一个配置
 
-### 9.4 本地回退后代理失效问题
+### 10.4 本地回退后代理失效问题
 
 - **问题**：远程浏览器连接失败回退到本地浏览器时，代理配置依然会应用
 - **但**：如果是代理本身导致的问题，本地浏览器也会同样失败
 - **注意**：本地浏览器启动参数里没有 `--proxy-server` 参数，代理是通过 Playwright 的 `context.proxy` 配置的
 
-### 9.5 代理测试接口名不副实
+### 10.5 代理测试接口名不副实
 
 - **问题**：测试接口 `/api/proxy/test` 实际上没有使用代理进行测试
 - **代码证据**：
@@ -961,29 +1196,41 @@ browser.newContext({ proxy: { server, username, password } })  ← 真正生效
   await browser.close();
   ```
 
-### 9.6 SDK 代理更新是死代码（详细原理见 8.1 节）
+### 10.6 SDK 代理更新是死代码（详细原理见 8.1 节）
 
 - **问题**：SDK 的 `PUT /api/sdk/robots/:id` 虽然接收 `proxy_url` 等参数并赋值给 `updateData`，但 Robot 模型根本没有这些字段
 - **影响**：Sequelize 静默丢弃这些值，数据库不存储，运行时也不读取。调用方以为给某个机器人设置了专属代理，实际全局代理没变
 - **代码证据**：`RobotAttributes` 接口无代理字段，`getDecryptedProxyConfig()` 只查 User 表
 
-### 9.7 SDK 用户级代理更新不立即生效
+### 10.7 SDK 用户级代理更新不立即生效
 
 **文件**: `server/src/api/sdk.ts`
 
 即使代理字段是正确写到 User 表（修复 SDK bug 之后），但正在运行的浏览器已经初始化完毕，代理配置已固化在 BrowserContext 里。只有**下次重新创建浏览器**时才会应用新的代理配置。
 
+### 10.8 崩溃恢复为文档任务错误创建浏览器（详细原理见 9.2 节）
+
+- **问题**：`processQueuedRuns` 不区分文档任务和浏览器任务，一律创建浏览器
+- **影响**：文档任务崩溃恢复后，浏览器实例被创建但从未使用，槽位泄漏；代理被初始化到 BrowserContext 但无人消费
+- **代码证据**：`processQueuedRuns` 无 `robotType` 检查
+
+### 10.9 调度路径 `runByUserId` 缺失（详细原理见 9.5 节）
+
+- **问题**：`scheduler/index.ts` 中 `Run.create` 不设置 `runByUserId`
+- **影响**：崩溃恢复后 `processQueuedRuns` 取到 null，浏览器创建可能失败或行为异常
+- **代码证据**：对比 `storage.ts` L1049 有 `runByUserId: req.user.id`，scheduler L77-L92 无此字段
+
 ---
 
-## 10. 改进建议
+## 11. 改进建议
 
-### 10.1 实现真正的代理池
+### 11.1 实现真正的代理池
 
 1. 新建 `Proxy` 模型表，支持多代理配置（每个用户可配置 N 个代理）
 2. 增加 `ProxyPool` 管理类，实现轮换策略（轮询、随机、最少使用、健康过滤）
 3. 每次创建浏览器时从池中选择一个**健康可用**的代理
 
-### 10.2 增加运行时代理切换能力
+### 11.2 增加运行时代理切换能力
 
 在 `RemoteBrowser` 中增加方法：
 
@@ -996,7 +1243,7 @@ public async switchProxy(newProxyConfig: ProxyConfig): Promise<void> {
 }
 ```
 
-### 10.3 失败时自动切换代理
+### 11.3 失败时自动切换代理
 
 修改重试逻辑，代理失败时从池中选择下一个代理：
 
@@ -1014,7 +1261,7 @@ while (!success && retryCount < MAX_RETRIES) {
 }
 ```
 
-### 10.4 修复代理测试接口
+### 11.4 修复代理测试接口
 
 ```typescript
 // 修复后的测试逻辑
@@ -1023,30 +1270,70 @@ const page = await context.newPage();
 await page.goto('https://example.com');
 ```
 
-### 10.5 本地回退时考虑代理因素
+### 11.5 本地回退时考虑代理因素
 
 如果 L2 代理层失败，先尝试下一个代理而不是直接回退到本地浏览器；如果是 L1 连接层失败，再考虑本地回退。
 
+### 11.6 修复 `processQueuedRuns` 对文档任务的处理
+
+`processQueuedRuns` 应在创建浏览器前检查 `robotType`，文档任务直接入队执行，无需浏览器：
+
+```typescript
+// 伪代码
+const interpreterSettings = queuedRun.interpreterSettings;
+const robotType = interpreterSettings?.robotType;
+const isDocRobot = robotType === 'doc-extract' || robotType === 'doc-parse';
+
+if (isDocRobot) {
+    // 文档任务直接入队执行，不创建浏览器
+    await addJob(QUEUE_NAMES.EXECUTE_RUN, {
+        userId,
+        runId: queuedRun.runId,
+        browserId: queuedRun.browserId || uuid(),
+    }, { maxAttempts: 1 });
+} else {
+    // 浏览器任务才创建浏览器
+    const newBrowserId = await createRemoteBrowserForRun(userId);
+    // ...
+}
+```
+
+### 11.7 修复调度路径 `runByUserId` 缺失
+
+在 `scheduler/index.ts` 的 `Run.create` 中补充 `runByUserId`：
+
+```typescript
+const run = await Run.create({
+    // ...
+    runByUserId: userId,    // ← 当前缺失，必须补上
+    // ...
+});
+```
+
 ---
 
-## 11. 相关文件清单
+## 12. 相关文件清单
 
 | 文件路径 | 职责 |
 |----------|------|
 | `server/src/models/User.ts` | 代理配置存储模型 |
+| `server/src/models/Run.ts` | 运行记录模型（含 runByUserId、interpreterSettings） |
+| `server/src/models/Robot.ts` | 机器人模型（无代理字段，SDK 代理更新为死代码） |
 | `server/src/routes/proxy.ts` | 代理配置 API、加解密、测试 |
 | `server/src/utils/auth.ts` | encrypt/decrypt 工具函数 |
 | `server/src/browser-management/classes/RemoteBrowser.ts` | 浏览器初始化、代理应用到 context |
 | `server/src/browser-management/browserConnection.ts` | 远程浏览器连接、重试、本地回退 |
 | `server/src/browser-management/classes/BrowserPool.ts` | 浏览器池管理、状态机、失效清理 |
 | `server/src/browser-management/controller.ts` | 浏览器创建入口、连接重试 |
-| `server/src/workflow-management/scheduler/index.ts` | 调度运行、运行级别重试 |
+| `server/src/workflow-management/scheduler/index.ts` | 调度运行、运行级别重试（runByUserId 缺失） |
 | `server/src/api/record.ts` | API 运行入口 |
-| `server/src/task-runner.ts` | 任务执行器、工作流执行、浏览器等待 |
+| `server/src/task-runner.ts` | 任务执行器、文档分支提前返回 |
 | `server/src/storage/graphileWorker.ts` | Graphile Worker 任务队列 |
 | `server/src/schedule-worker.ts` | 调度工作者、调度任务入队 |
-| `server/src/routes/storage.ts` | 运行存储、孤儿运行恢复、排队运行处理 |
+| `server/src/routes/storage.ts` | 运行存储、孤儿运行恢复、排队运行处理（不区分文档任务） |
 | `server/src/server.ts` | 服务启动、恢复流程、定时清理 |
-| `server/src/api/sdk.ts` | SDK 接口、允许更新代理配置 |
+| `server/src/api/sdk.ts` | SDK 接口、代理更新死代码 |
+| `server/src/utils/document/executeDocumentRun.ts` | 文档提取执行（MinIO + LLM，无浏览器无代理） |
+| `server/src/utils/document/executeDocumentParseRun.ts` | 文档解析执行（MinIO + 解析，无浏览器无代理） |
 | `src/components/proxy/ProxyForm.tsx` | 前端代理配置表单 |
 | `src/api/proxy.ts` | 前端代理 API 调用 |
