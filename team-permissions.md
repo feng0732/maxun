@@ -8,7 +8,7 @@ Maxun 的权限模型是一个 **单用户隔离模型**（Single-User Isolation
 
 | 层次 | 机制 | 代码位置 |
 |------|------|----------|
-| 身份认证 | `requireSignIn` / `requireAPIKey` 中间件 | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/middlewares/auth.ts), [api.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/middlewares/api.ts) |
+| 身份认证 | `requireSignIn` / `requireAPIKey` 中间件 | [auth.ts](server/src/middlewares/auth.ts), [api.ts](server/src/middlewares/api.ts) |
 | 访问判断 | 每个路由内部 `userId` 条件检查 | 各 `routes/*.ts` 文件 |
 | 数据范围限制 | Sequelize 查询中 `where: { userId }` 过滤 | 各路由的数据库查询语句 |
 
@@ -20,7 +20,7 @@ Maxun 的权限模型是一个 **单用户隔离模型**（Single-User Isolation
 
 系统只有 `User` 一个身份实体，没有 Team/Organization/Role 模型。
 
-**User 模型** — [User.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/models/User.ts#L18-L28)
+**User 模型** — [User.ts](server/src/models/User.ts#L18-L28)
 
 ```typescript
 class User {
@@ -36,7 +36,7 @@ class User {
 }
 ```
 
-**Robot 模型** — [Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/models/Robot.ts#L77-L95)
+**Robot 模型** — [Robot.ts](server/src/models/Robot.ts#L77-L95)
 
 ```typescript
 class Robot {
@@ -51,7 +51,7 @@ class Robot {
 }
 ```
 
-**Run 模型** — [Run.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/models/Run.ts#L39-L60)
+**Run 模型** — [Run.ts](server/src/models/Run.ts#L39-L60)
 
 ```typescript
 class Run {
@@ -69,7 +69,7 @@ class Run {
 }
 ```
 
-**模型关联** — [associations.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/models/associations.ts)
+**模型关联** — [associations.ts](server/src/models/associations.ts)
 
 ```typescript
 Run.belongsTo(Robot, { foreignKey: 'robotId' });
@@ -99,7 +99,7 @@ User (1) ──configures──▶ Proxy Config (1)    // proxy_* 字段直接�
 
 #### 路径 A：Web UI 认证（JWT Cookie）
 
-**`requireSignIn`** — [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/middlewares/auth.ts#L8-L31)
+**`requireSignIn`** — [auth.ts](server/src/middlewares/auth.ts#L8-L31)
 
 ```
 请求 → Cookie 中取 token → JWT verify → req.user = { id } → next()
@@ -115,7 +115,7 @@ User (1) ──configures──▶ Proxy Config (1)    // proxy_* 字段直接�
 
 #### 路径 B：API / SDK 认证（API Key Header）
 
-**`requireAPIKey`** — [api.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/middlewares/api.ts#L5-L23)
+**`requireAPIKey`** — [api.ts](server/src/middlewares/api.ts#L5-L23)
 
 ```
 请求 → Header 取 x-api-key → User.findOne({ where: { api_key } }) → req.user = user → next()
@@ -133,16 +133,16 @@ User (1) ──configures──▶ Proxy Config (1)    // proxy_* 字段直接�
 
 | 路由文件 | 中间件 | 二次检查模式 |
 |----------|--------|-------------|
-| [record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/record.ts) | `router.all('/', requireSignIn, ...)` | `if (!req.user) return 401` |
-| [workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/workflow.ts) | `router.all('/', requireSignIn, ...)` | `if (!req.user) return 401` |
-| [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/storage.ts) | `router.all('/', requireSignIn, ...)` | `if (!req.user) return 401` |
-| [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/auth.ts) | 逐路由 `requireSignIn` | N/A |
-| [proxy.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/proxy.ts) | 逐路由 `requireSignIn` | `if (!authenticatedReq.user)` |
-| [webhook.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/webhook.ts) | 逐路由 `requireSignIn` | `if (!authenticatedReq.user)` |
-| [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/api/sdk.ts) | 逐路由 `requireAPIKey` | `if (!req.user)` |
-| [record.ts (api)](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/api/record.ts) | 逐路由 `requireAPIKey` | `if (!authenticatedReq.user)` |
+| [record.ts](server/src/routes/record.ts) | `router.all('/', requireSignIn, ...)` | `if (!req.user) return 401` |
+| [workflow.ts](server/src/routes/workflow.ts) | `router.all('/', requireSignIn, ...)` | `if (!req.user) return 401` |
+| [storage.ts](server/src/routes/storage.ts) | `router.all('/', requireSignIn, ...)` | `if (!req.user) return 401` |
+| [auth.ts](server/src/routes/auth.ts) | 逐路由 `requireSignIn` | N/A |
+| [proxy.ts](server/src/routes/proxy.ts) | 逐路由 `requireSignIn` | `if (!authenticatedReq.user)` |
+| [webhook.ts](server/src/routes/webhook.ts) | 逐路由 `requireSignIn` | `if (!authenticatedReq.user)` |
+| [sdk.ts](server/src/api/sdk.ts) | 逐路由 `requireAPIKey` | `if (!req.user)` |
+| [record.ts (api)](server/src/api/record.ts) | 逐路由 `requireAPIKey` | `if (!authenticatedReq.user)` |
 
-**前端路由守卫** — [userRoute.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/src/routes/userRoute.tsx)
+**前端路由守卫** — [userRoute.tsx](src/routes/userRoute.tsx)
 
 ```typescript
 return state.user ? <Outlet /> : <Navigate to="/login" />;
@@ -152,16 +152,16 @@ return state.user ? <Outlet /> : <Navigate to="/login" />;
 
 ### 3.3 WebSocket 连接的认证
 
-**Recording Socket** — [connection.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/socket-connection/connection.ts)
+**Recording Socket** — [connection.ts](server/src/socket-connection/connection.ts)
 
 - `createSocketConnection` 接受 `userId` 参数，注册 Input Handler 时绑定该 userId
 - 无 Token 验证：Socket 连接时不校验客户端身份，仅依赖 HTTP 层已有的认证
 
-**Queued-Run Namespace** — [server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/server.ts#L179-L201)
+**Queued-Run Namespace** — [server.ts](server/src/server.ts#L179-L201)
 
 ```typescript
 io.of('/queued-run').on('connection', (socket) => {
-    const userId = socket.handshake.query.userId;
+    const userId = socket.handshake.query.userId as string;
     if (userId) {
         socket.join(`user-${userId}`);
     } else {
@@ -227,19 +227,19 @@ await Robot.destroy({
 
 | 资源 | 查询过滤方式 | 写入归属 | 代码示例 |
 |------|-------------|---------|----------|
-| **Robot** | `where: { userId }` | 创建时 `userId: req.user.id` | [storage.ts#L181](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/storage.ts#L181) |
-| **Run** | 通过 Robot 的 userId 间接过滤 | 创建时 `runByUserId: req.user.id` | [storage.ts#L941-L944](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/storage.ts#L941) |
-| **API Key** | `User.findByPk(req.user.id)` | 更新当前 User 的 api_key 字段 | [auth.ts#L246](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/auth.ts#L246) |
-| **Proxy** | `User.findByPk(req.user.id)` | 更新当前 User 的 proxy_* 字段 | [proxy.ts#L23](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/proxy.ts#L23) |
-| **Webhook** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 webhooks 字段 | [webhook.ts#L74](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/webhook.ts#L74) |
-| **Google Sheets** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 google_* 字段 | [auth.ts#L425-L426](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/auth.ts#L425) |
-| **Airtable** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 airtable_* 字段 | [auth.ts#L749-L750](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/auth.ts#L749) |
-| **Schedule** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 schedule 字段 | [storage.ts#L1234](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/storage.ts#L1234) |
-| **Browser** | `browserPool.getActiveBrowserId(userId, state)` | 创建时绑定 userId | [BrowserPool.ts#L93](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/browser-management/classes/BrowserPool.ts#L93) |
+| **Robot** | `where: { userId }` | 创建时 `userId: req.user.id` | [storage.ts#L181](server/src/routes/storage.ts#L181) |
+| **Run** | 通过 Robot 的 userId 间接过滤 | 创建时 `runByUserId: req.user.id` | [storage.ts#L941-L944](server/src/routes/storage.ts#L941) |
+| **API Key** | `User.findByPk(req.user.id)` | 更新当前 User 的 api_key 字段 | [auth.ts#L246](server/src/routes/auth.ts#L246) |
+| **Proxy** | `User.findByPk(req.user.id)` | 更新当前 User 的 proxy_* 字段 | [proxy.ts#L23](server/src/routes/proxy.ts#L23) |
+| **Webhook** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 webhooks 字段 | [webhook.ts#L74](server/src/routes/webhook.ts#L74) |
+| **Google Sheets** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 google_* 字段 | [auth.ts#L425-L426](server/src/routes/auth.ts#L425) |
+| **Airtable** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 airtable_* 字段 | [auth.ts#L749-L750](server/src/routes/auth.ts#L749) |
+| **Schedule** | `Robot.findOne({ where: { ..., userId } })` | 更新归属 Robot 的 schedule 字段 | [storage.ts#L1234](server/src/routes/storage.ts#L1234) |
+| **Browser** | `browserPool.getActiveBrowserId(userId, state)` | 创建时绑定 userId | [BrowserPool.ts#L93](server/src/browser-management/classes/BrowserPool.ts#L93) |
 
 ### 4.3 浏览器资源池的隔离
 
-**BrowserPool** — [BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/browser-management/classes/BrowserPool.ts)
+**BrowserPool** — [BrowserPool.ts](server/src/browser-management/classes/BrowserPool.ts)
 
 BrowserPool 实现了 **"1 User - 2 Browser"** 策略：
 
@@ -271,7 +271,7 @@ const robots = await Robot.findAll({
 });
 ```
 
-数据库层有唯一索引约束（迁移 [20250612000000-add-robot-name-unique-index.js](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/db/migrations/20250612000000-add-robot-name-unique-index.js)），但应用层已做 userId 限定。
+数据库层有唯一索引约束（迁移 [20250612000000-add-robot-name-unique-index.js](server/src/db/migrations/20250612000000-add-robot-name-unique-index.js)），但应用层已做 userId 限定。
 
 ---
 
@@ -340,7 +340,7 @@ const robots = await Robot.findAll({
 
 前端实现了基于活动检测的自动登出：
 
-**[auth.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/src/context/auth.tsx#L70-L79)**
+**[auth.tsx](src/context/auth.tsx#L70-L79)**
 
 - 超时时间：4 小时（`AUTO_LOGOUT_TIME = 4 * 60 * 60 * 1000`）
 - 检测事件：mousedown / keydown / scroll / touchstart
@@ -353,12 +353,12 @@ const robots = await Robot.findAll({
 
 ### 7.1 密码存储
 
-- 使用 bcrypt 哈希，salt rounds = 12 — [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/utils/auth.ts#L5-L19)
+- 使用 bcrypt 哈希，salt rounds = 12 — [auth.ts](server/src/utils/auth.ts#L5-L19)
 - 注册/登录时分别调用 `hashPassword` / `comparePassword`
 
 ### 7.2 代理凭据加密
 
-- 使用 AES-256-CBC 加密存储 — [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/utils/auth.ts#L26-L43)
+- 使用 AES-256-CBC 加密存储 — [auth.ts](server/src/utils/auth.ts#L26-L43)
 - IV 随机生成，与密文拼接存储（格式：`iv:encrypted`）
 - 读取时解密，展示时脱敏（仅显示前3后3字符）
 
@@ -369,27 +369,27 @@ const robots = await Robot.findAll({
 
 ---
 
-## 9. 队列运行处理的权限绕开与数据访问
+## 8. 队列运行处理的权限绕开与数据访问
 
 队列运行处理（Queued Run Processing）是系统中最容易 **绕开用户认证层** 的场景之一：它由定时轮询和 graphile-worker 异步作业驱动，完全不经过 HTTP 中间件链，所有用户上下文都必须 **主动携带**（carried context）而非被动注入（passive injected）。
 
-### 9.1 流程总览
+### 8.1 流程总览
 
 ```
 用户请求入队 ──▶ Run.status='queued', runByUserId=userId
                          │
         ┌────────────────┴───────────────────┐
         │                                    │
-  轮询定时器（每1s）                     graphile-worker
+  轮询定时器（每5s）                     graphile-worker
   processQueuedRuns()                   processRunExecution(data)
   【零认证，全表扫描】                   【data.userId 是唯一凭证】
 ```
 
-### 9.2 processQueuedRuns — 全局调度器的无认证行为
+### 8.2 processQueuedRuns — 全局调度器的无认证行为
 
-**[storage.ts#L1493-L1566](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/storage.ts#L1493-L1566)**
+**[storage.ts#L1493-L1566](server/src/routes/storage.ts#L1493-L1566)**
 
-该函数由 `setInterval` 每 1 秒调用一次，触发入口是 [server.ts#L151-L158](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/server.ts#L151-L158)。
+该函数由 `setInterval` 每 5 秒调用一次（`5000ms`），触发入口是 [server.ts#L151-L158](server/src/server.ts#L151-L158)。
 
 **访问控制分析：**
 
@@ -404,24 +404,24 @@ const robots = await Robot.findAll({
 
 > **关键发现**：步骤 ③ Robot 查询 **缺少 `userId: runByUserId` 联合条件**。虽然这是内部代码路径（非用户直接输入），但如果攻击者能在 Run 表中构造虚假的 `robotMetaId`，理论上可读取其他用户的 Robot 工作流（含 Google/Airtable 凭据字段）。
 
-### 9.3 recoverOrphanedRuns — 启动时的孤儿恢复
+### 8.3 recoverOrphanedRuns — 启动时的孤儿恢复
 
-**[storage.ts#L1572-L1643](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/storage.ts#L1572-L1643)**
+**[storage.ts#L1572-L1643](server/src/routes/storage.ts#L1572-L1643)**
 
-在 [server.ts#L171-L176](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/server.ts#L171-L176) 启动后立即执行一次。
+在 [server.ts#L171-L176](server/src/server.ts#L171-L176) 启动后立即执行一次。
 
 **访问控制分析：**
 
 - `Run.findAll({ where: { status: ['running', 'scheduled'] } })` — ❌ **全局扫描，无用户过滤**
 - 对于每个孤儿 run，检查 `browserPool.getRemoteBrowser(browserId)` 以判断浏览器是否仍存活
 - 若浏览器已不存在：根据 retryCount 将 run 重新标记为 `queued` 或 `failed`
-- 重新入队后，run 会带着 **原始的 runByUserId** 再次经过 processQueuedRuns，流程同 9.2
+- 重新入队后，run 会带着 **原始的 runByUserId** 再次经过 processQueuedRuns，流程同 8.2
 
 > **风险**：此函数不校验当前服务端是否"拥有"这些 Run（比如在多实例部署时，runByUserId 对应的用户资源可能在另一台实例上）。但由于 BrowserPool 是进程内单例，误标记为 orphan 最多触发重试，不会泄露跨用户数据。
 
-### 9.4 graphile-worker 中的 EXECUTE_RUN 任务
+### 8.4 graphile-worker 中的 EXECUTE_RUN 任务
 
-**[task-runner.ts#L130-L419](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/task-runner.ts#L130-L419)** 中的 `processRunExecution(data: ExecuteRunData)`。
+**[task-runner.ts#L130-L419](server/src/task-runner.ts#L130-L419)** 中的 `processRunExecution(data: ExecuteRunData)`。
 
 data 结构：
 ```typescript
@@ -440,9 +440,9 @@ data 结构：
 
 > **双重绕过点**：Run 和 Robot 查询均无 userId 联合过滤。如果 data.userId 和 run.robotMetaId 不一致（被恶意构造），就会用 **用户 A 的代理配置** 去执行 **用户 B 的 Robot 工作流**，这是跨用户资源混用的严重问题。
 
-### 9.5 调度器（Scheduler）中的定时运行
+### 8.5 调度器（Scheduler）中的定时运行
 
-**[scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/workflow-management/scheduler/index.ts)**
+**[scheduler/index.ts](server/src/workflow-management/scheduler/index.ts)**
 
 调度场景有两条路径：
 
@@ -464,7 +464,7 @@ await createWorkflowAndStoreMetadata(id, userId);
 
 **路径 B：`handleRunRecording` 内部回连**
 
-[handleRunRecording](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/workflow-management/scheduler/index.ts#L860-L909) 中 scheduler 进程作为 **Socket.IO 客户端** 主动连接自身 HTTP 服务：
+[handleRunRecording](server/src/workflow-management/scheduler/index.ts#L860-L909) 中 scheduler 进程作为 **Socket.IO 客户端** 主动连接自身 HTTP 服务：
 
 ```typescript
 socket = io(`http://localhost:5000/${browserId}`, {
@@ -477,7 +477,7 @@ socket = io(`http://localhost:5000/${browserId}`, {
 - 这条连接 **完全绕过 HTTP 认证**（不走 Cookie，不带 x-api-key）
 - 依赖的安全性完全建立在：`browserId` 是 UUID 难以猜测 + namespace 是动态创建且仅短时间存在
 
-### 9.6 队列处理的权限风险汇总
+### 8.6 队列处理的权限风险汇总
 
 | # | 场景 | 问题 | 严重度 |
 |---|------|------|--------|
@@ -489,28 +489,30 @@ socket = io(`http://localhost:5000/${browserId}`, {
 
 ---
 
-## 10. Webhook 回调的权限模型
+## 9. Webhook 回调的权限模型
 
 Webhook 系统分为两部分：**Webhook 配置的 CRUD**（受 `requireSignIn` 保护）和 **Webhook 的触发发送**（后台异步，完全绕开认证）。
 
-### 10.1 Webhook 配置管理（受权限保护）
+webhook 路由在 [server.ts#L119](server/src/server.ts#L119) 中挂载于 `/webhook` 前缀，即所有端点以 `/webhook` 开头。
 
-**[webhook.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/webhook.ts)**
+### 9.1 Webhook 配置管理（受权限保护）
 
-| 端点 | 中间件 | Robot 归属校验 |
-|------|--------|---------------|
-| `POST /add` | `requireSignIn` | ✅ `where: { 'recording_meta.id': robotId, userId }` |
-| `PUT /update` | `requireSignIn` | ✅ 同上 |
-| `DELETE /remove` | `requireSignIn` | ✅ 同上 |
-| `DELETE /clear/:robotId` | `requireSignIn` | ✅ 同上 |
-| `GET /get/:robotId` | `requireSignIn` | ✅ 同上 |
-| `PUT /:robotId/test` | `requireSignIn` | ✅ 同上 |
+**[webhook.ts](server/src/routes/webhook.ts)**
+
+| 端点（完整路径） | HTTP 方法 | 中间件 | Robot 归属校验 |
+|-----------------|----------|--------|---------------|
+| `/webhook/add` | `POST` | `requireSignIn` | ✅ `where: { 'recording_meta.id': robotId, userId }` |
+| `/webhook/update` | `POST` | `requireSignIn` | ✅ 同上 |
+| `/webhook/remove` | `POST` | `requireSignIn` | ✅ 同上 |
+| `/webhook/list/:robotId` | `GET` | `requireSignIn` | ✅ 同上 |
+| `/webhook/test` | `POST` | `requireSignIn` | ✅ 同上 |
+| `/webhook/clear/:robotId` | `DELETE` | `requireSignIn` | ✅ 同上 |
 
 所有 CRUD 操作都正确做了 userId 过滤。
 
-### 10.2 sendWebhook — 异步发送路径（绕开认证）
+### 9.2 sendWebhook — 异步发送路径（绕开认证）
 
-**[webhook.ts#L404-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/routes/webhook.ts#L404-L434)**
+**[webhook.ts#L404-L434](server/src/routes/webhook.ts#L404-L434)**
 
 ```typescript
 export const sendWebhook = async (robotId: string, eventType: string, data: any): Promise<void> => {
@@ -522,53 +524,123 @@ export const sendWebhook = async (robotId: string, eventType: string, data: any)
     const activeWebhooks = robot.webhooks.filter(
         w => w.active && w.events.includes(eventType)
     );
-    // ... 发送 HTTP POST 到 webhook.url
+
+    const webhookPromises = activeWebhooks.map(async (webhook: WebhookConfig) => {
+        const payload = {
+            event_type: eventType,
+            timestamp: new Date().toISOString(),
+            webhook_id: webhook.id,
+            data: data
+        };
+        return sendWebhookWithRetry(robotId, webhook, payload);
+    });
+
+    await Promise.allSettled(webhookPromises);
 };
 ```
 
-**调用链（5 处触发点）：**
+**调用链（13 处触发点）：**
 
 | 调用位置 | 调用者身份 | 传入的 robotMetaId 来源 |
 |----------|-----------|----------------------|
-| [scheduler/index.ts#L492](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/workflow-management/scheduler/index.ts#L492) | scheduled-workflow 任务 | `plainRun.robotMetaId`（Run 表中读出） |
-| [scheduler/index.ts#L749](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/workflow-management/scheduler/index.ts#L749) | handleRunRecording 内部 | `plainRun.robotMetaId` |
-| [scheduler/index.ts#L799](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/workflow-management/scheduler/index.ts#L799) | handleRunRecording 失败路径 | `run.robotMetaId` |
-| [task-runner.ts#L358](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/task-runner.ts#L358) | execute-run 任务（手动运行） | `plainRun.robotMetaId` |
-| [task-runner.ts#L493](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/task-runner.ts#L493) | execute-run 任务（scrape 类型） | `plainRun.robotMetaId` |
-| [task-runner.ts#L543](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/task-runner.ts#L543) | execute-run 失败路径 | `plainRun.robotMetaId` |
-| [task-runner.ts#L567](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/task-runner.ts#L567) | execute-run 最终失败 | `run.robotMetaId` |
-| [api/record.ts#L1017](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/api/record.ts#L1017) | API/SDK 运行 | `plainRun.robotMetaId` |
-| [api/record.ts#L1080](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/api/record.ts#L1080) | API 失败路径 | `plainRun.robotMetaId` |
-| [executeDocumentParseRun.ts#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/utils/document/executeDocumentParseRun.ts#L53) | doc-parse 类型运行 | `robotMeta.id` |
-| [executeDocumentRun.ts#L67](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/utils/document/executeDocumentRun.ts#L67) | doc-extract 类型运行 | `robotMeta.id` |
+| [scheduler/index.ts#L492](server/src/workflow-management/scheduler/index.ts#L492) | scheduled-workflow 任务（doc robot 成功） | `plainRun.robotMetaId` |
+| [scheduler/index.ts#L749](server/src/workflow-management/scheduler/index.ts#L749) | scheduled-workflow 任务（scrape 成功） | `plainRun.robotMetaId` |
+| [scheduler/index.ts#L799](server/src/workflow-management/scheduler/index.ts#L799) | scheduled-workflow 任务（失败） | `run.robotMetaId` |
+| [task-runner.ts#L358](server/src/task-runner.ts#L358) | execute-run 任务（scrape 成功） | `plainRun.robotMetaId` |
+| [task-runner.ts#L493](server/src/task-runner.ts#L493) | execute-run 任务（scrape 成功） | `plainRun.robotMetaId` |
+| [task-runner.ts#L543](server/src/task-runner.ts#L543) | execute-run 任务（scrape 失败） | `plainRun.robotMetaId` |
+| [task-runner.ts#L567](server/src/task-runner.ts#L567) | execute-run 任务（最终失败） | `run.robotMetaId` |
+| [api/record.ts#L1017](server/src/api/record.ts#L1017) | API/SDK 运行（scrape 成功） | `plainRun.robotMetaId` |
+| [api/record.ts#L1080](server/src/api/record.ts#L1080) | API/SDK 运行（scrape 失败） | `plainRun.robotMetaId` |
+| [api/record.ts#L1302](server/src/api/record.ts#L1302) | API/SDK 运行（工作流成功） | `plainRun.robotMetaId` |
+| [api/record.ts#L1377](server/src/api/record.ts#L1377) | API/SDK 运行（工作流失败） | `run.robotMetaId` |
+| [executeDocumentParseRun.ts#L53](server/src/utils/document/executeDocumentParseRun.ts#L53) | doc-parse 类型运行 | `robotMeta.id` |
+| [executeDocumentRun.ts#L67](server/src/utils/document/executeDocumentRun.ts#L67) | doc-extract 类型运行 | `robotMeta.id` |
 
-### 10.3 Webhook 数据泄露风险分析
+### 9.3 Webhook 测试 Payload
+
+**[webhook.ts#L272-L354](server/src/routes/webhook.ts#L272-L354)** 中 `/webhook/test` 端点发送的测试 payload 是一个完整的模拟数据结构：
+
+```typescript
+const testPayload = {
+    event_type: "webhook_test",
+    timestamp: new Date().toISOString(),
+    webhook_id: webhook.id,
+    data: {
+        robot_id: robotId,
+        run_id: "110c4dae-c39b-4b30-a932-eff1022e4bb0",
+        robot_name: robot.recording_meta?.name || "E-commerce Product Scraper",
+        status: "test",
+        started_at: new Date(Date.now() - 45000).toISOString(),
+        finished_at: new Date().toISOString(),
+        extracted_data: {
+            captured_texts: [
+                {
+                    "Product Name": "MacBook Pro 16-inch M3 Max",
+                    "Price": "$3,999.00",
+                    "Rating": "4.8/5 stars",
+                    "Availability": "In Stock - Ships within 2-3 business days",
+                    "SKU": "MBPM3-16-1TB-SLV",
+                    "Description": "The most powerful MacBook Pro ever..."
+                }
+            ],
+            captured_lists: {
+                "list_1": [
+                    { "Rank": "1", "Product": "MacBook Air M2", "Category": "Laptops", "Units Sold": "2,847", "Revenue": "$2,847,000" },
+                    { "Rank": "2", "Product": "iPhone 15", "Category": "Smartphones", "Units Sold": "1,923", "Revenue": "$1,923,000" },
+                    // ... 更多模拟数据
+                ],
+                // ...
+            },
+            total_rows: 11,
+            captured_texts_count: 5,
+            captured_lists_count: 6,
+            screenshots_count: 5
+        },
+        metadata: {
+            test_mode: true,
+            browser_id: "d27ace57-75cb-441c-8589-8ba34e52f7d1",
+            user_id: 108,
+        }
+    }
+};
+```
+
+- 测试 payload 包含完整的 `event_type`、`timestamp`、`webhook_id` 信封结构
+- `data.extracted_data` 中填充了模拟的电商商品抓取结果
+- `metadata.test_mode: true` 标记这是测试调用
+- 注意：`metadata.user_id: 108` 是硬编码的示例值，**不反映当前登录用户的真实 ID**
+
+### 9.4 Webhook 数据泄露风险分析
 
 **sendWebhook 查询 Robot 时缺少 userId 过滤**，这意味着：
 
 1. **理论风险**：若攻击者能控制某条代码路径的 `robotMetaId` 参数传入 `sendWebhook`，就可触发向 **任意用户配置的 webhook URL** 发送 HTTP 请求（SSRF 风险），或读取任意 Robot 的 webhook 配置列表。
 
-2. **实际触发场景**：目前所有 11 处调用都来自 Run 表中已存储的 `robotMetaId`，或来自 Robot 查询结果本身。由于 Run 和 Robot 的关联是内部创建的，攻击者如果无法直接写 Run 表，则此路径不易被利用。
+2. **实际触发场景**：目前所有 13 处调用都来自 Run 表中已存储的 `robotMetaId`，或来自 Robot 查询结果本身。由于 Run 和 Robot 的关联是内部创建的，攻击者如果无法直接写 Run 表，则此路径不易被利用。
 
 3. **Payload 泄露**：webhook payload 中包含完整的抓取结果（markdown/html/links 等）。如果 webhook URL 本身被恶意配置（比如某用户将 URL 设为攻击者服务器），**只会泄露该用户自己的 Robot 运行结果**，不会跨用户泄露（因为 robotMetaId 是从属于用户的 Run 中取出的）。
 
-4. **无签名/Secret 校验**：`sendWebhookWithRetry` 仅发送 `payload`，不计算 HMAC 签名。接收方无法验证 webhook 的真实性。
+4. **无签名/Secret 校验**：`sendWebhookWithRetry` 仅发送 `payload`，不计算 HMAC 签名。接收方无法验证 webhook 的真实性和完整性。
 
-### 10.4 Webhook 权限问题汇总
+5. **SSRF 风险**：`/webhook/test` 允许用户配置任意 URL 并发送上述大型 payload。如果服务端网络环境允许内网访问，可被用于 SSRF 探测内网。
+
+### 9.5 Webhook 权限问题汇总
 
 | # | 问题 | 详情 | 严重度 |
 |---|------|------|--------|
 | W1 | sendWebhook 查 Robot 无 userId 过滤 | 缺少 `userId` 联合条件，内部防御深度不足 | 低 |
 | W2 | 无 HMAC 签名 | 接收方无法验证消息来源和完整性 | 低 |
-| W3 | test-webhook 接口可触发 SSRF | 用户可配置任意 URL，发送固定测试 payload | 低（payload 固定为 `{"test":"ok"}`） |
+| W3 | test-webhook 接口可触发 SSRF | 用户可配置任意 URL，发送完整测试 payload | 中（payload 包含大量模拟数据） |
+| W4 | 测试 payload 硬编码 user_id: 108 | 测试调用的 metadata.user_id 不反映真实用户 | 低 |
 
 ---
 
-## 11. 本机/浏览器链接（Socket + BrowserPool）的身份绑定
+## 10. 本机/浏览器链接（Socket + BrowserPool）的身份绑定
 
 Maxun 的浏览器交互链路高度依赖 **用户 ID ↔ 浏览器 ID ↔ Socket Namespace** 三者的绑定。这是一条 **完全绕过 HTTP 认证中间件** 的通道。
 
-### 11.1 三层绑定关系
+### 10.1 三层绑定关系
 
 ```
 User.id (number)
@@ -589,9 +661,9 @@ browserPool.getActiveBrowserId(userId, "recording")
 操作对应的 RemoteBrowser
 ```
 
-### 11.2 Recording 路径：userId 绑定的完整链路
+### 10.2 Recording 路径：userId 绑定的完整链路
 
-**[controller.ts#L26-L104](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/browser-management/controller.ts#L26-L104)** — `initializeRemoteBrowserForRecording(userId)`
+**[controller.ts#L26-L104](server/src/browser-management/controller.ts#L26-L104)** — `initializeRemoteBrowserForRecording(userId)`
 
 ```
 HTTP POST /recordings/start (requireSignIn)
@@ -622,15 +694,15 @@ initializeRemoteBrowserForRecording(userId.toString(), mode)
 
 **关键安全机制**：
 
-1. **闭包绑定 userId**：[registerInputHandlers](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/browser-management/inputHandlers.ts#L871-L887) 中每个 socket 事件 handler 都是通过闭包绑定了创建时的 userId，不从 socket 消息中读取 userId。这意味着即使客户端能连接到 namespace，发送的所有操作仍然指向创建者 userId 的浏览器。
+1. **闭包绑定 userId**：[registerInputHandlers](server/src/browser-management/inputHandlers.ts#L871-L887) 中每个 socket 事件 handler 都是通过闭包绑定了创建时的 userId，不从 socket 消息中读取 userId。这意味着即使客户端能连接到 namespace，发送的所有操作仍然指向创建者 userId 的浏览器。
 
 2. **BrowserPool 按 userId 查询**：`getActiveBrowserId(userId, state)` 始终先查 `userToBrowserMap.get(userId)`，再过滤 state。客户端无法通过 socket 消息指定操作其他用户的浏览器。
 
 3. **浏览器槽位限制**：`addRemoteBrowser` 中每个 userId 最多 2 个浏览器（1 recording + 1 run），防资源耗尽。
 
-### 11.3 Run 路径：浏览器创建与权限
+### 10.3 Run 路径：浏览器创建与权限
 
-**[controller.ts#L114-L137](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/browser-management/controller.ts#L114-L137)** — `createRemoteBrowserForRun(userId)`
+**[controller.ts#L114-L137](server/src/browser-management/controller.ts#L114-L137)** — `createRemoteBrowserForRun(userId)`
 
 ```typescript
 export const createRemoteBrowserForRun = (userId: string): string => {
@@ -646,46 +718,46 @@ export const createRemoteBrowserForRun = (userId: string): string => {
 
 Run 路径不注册 input handler（因为不需要用户交互），但 browserId 仍加入 `userToBrowserMap`，代理配置同样按 userId 获取。
 
-### 11.4 Socket 连接的身份验证缺口
+### 10.4 Socket 连接的身份验证缺口
 
 虽然 handler 内部用闭包绑定 userId，但 **Socket.IO 连接建立本身不做任何身份验证**：
 
 #### Recording Namespace（`/${browserId}`）
 
-- [createSocketConnection](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/socket-connection/connection.ts#L12-L29)：`io.on('connection', onConnection)` 没有任何 `socket.handshake.auth` 或 token 校验。
+- [createSocketConnection](server/src/socket-connection/connection.ts#L12-L29)：`io.on('connection', onConnection)` 没有任何 `socket.handshake.auth` 或 token 校验。
 - 客户端连接时仅需知道 `browserId` 即可。但 browserId 是 UUID v4，2^122 空间，暴力猜测不现实。
 - **实际风险**：如果 browserId 通过某种方式泄露（如日志、错误消息、URL 参数），攻击者可连接到该 namespace：
   - 接收 DOM 流（可看到目标页面内容）
-  - 但 **无法触发操作他人浏览器**（所有 input 操作走 `getActiveBrowserId(userId, "recording")`，攻击者 socket 的 handler 绑定的 userId 是 **创建 namespace 时传入的 userId**，不是攻击者自己的 id。等等——这里有个关键逻辑需要澄清：
-  - namespace 创建时 `createSocketConnection(io.of(id), userId, callback)` 会在 `io.on('connection')` 时为 **所有后来连接的 socket** 都注册 **同一个 userId** 的 handler。**这意味着任何能连接到该 namespace 的客户端，发送的所有 input 操作都会被当作原始 userId 的操作执行**。这是一个 **严重的越权风险**。
+  - 由于 `createSocketConnection(io.of(id), userId, callback)` 会在 `io.on('connection')` 时为 **所有后来连接的 socket** 都注册 **同一个 userId** 的 handler，**任何能连接到该 namespace 的客户端发送的所有 input 操作都会被当作原始 userId 的操作执行**。这是一个 **严重的越权风险**。
 
 #### Run Namespace（`/${browserId}`）
 
-- [createSocketConnectionForRun](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/socket-connection/connection.ts#L38-L49)：同样无认证。
+- [createSocketConnectionForRun](server/src/socket-connection/connection.ts#L38-L49)：同样无认证。
 - 但 run 路径没有 input handler，仅使用 namespace 推送运行状态（run-started、run-completed 等）。泄露后果：攻击者可看到他人的运行进度和结果数据。
 
 #### Queued-Run Namespace（`/queued-run`）
 
-- [server.ts#L179-L201](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/server.ts#L179-L201)：仅根据 handshake.query.userId 加入 room，**不验证该 userId 的真实性**。
+- [server.ts#L179-L201](server/src/server.ts#L179-L201)：仅根据 handshake.query.userId 加入 room，**不验证该 userId 的真实性**。
 - 恶意客户端可构造 `?userId=<targetUserId>` 加入任意用户的 room，接收该用户所有 run-scheduled / run-started / run-completed 通知。
 
-### 11.5 调度器的内部回连（Intra-process Socket Loopback）
+### 10.5 调度器的内部回连（Intra-process Socket Loopback）
 
-[handleRunRecording](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/workflow-management/scheduler/index.ts#L882-L886) 中 scheduler 作为 Socket.IO 客户端连接自身：
+[handleRunRecording](server/src/workflow-management/scheduler/index.ts#L882-L886) 中 scheduler 作为 Socket.IO 客户端连接自身：
 
 ```typescript
-socket = io(`http://localhost:5000/${browserId}`, {
+socket = io(`${process.env.BACKEND_URL ? process.env.BACKEND_URL : 'http://localhost:5000'}/${browserId}`, {
   transports: ['websocket'],
   rejectUnauthorized: false,
+  timeout: 30000,
 });
 ```
 
 - 这是合法的内部通信，但它 **完全依靠 browserId 的保密性作为安全边界**。
 - 如果 namespace socket 没有 auth 中间件，这条内部通道和外部攻击者可利用的通道在安全等级上相同。
 
-### 11.6 BrowserPool 身份查询 API
+### 10.6 BrowserPool 身份查询 API
 
-**[BrowserPool.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/116-maxun/server/src/browser-management/classes/BrowserPool.ts)**
+**[BrowserPool.ts](server/src/browser-management/classes/BrowserPool.ts)**
 
 | 方法 | 是否校验 userId | 作用 |
 |------|----------------|------|
@@ -700,7 +772,7 @@ socket = io(`http://localhost:5000/${browserId}`, {
 
 > **关注点**：`getRemoteBrowser(id)` 无 userId 校验。如果内部代码路径获得了一个 browserId（比如从 Run 表中读取），可以直接拿到 RemoteBrowser 实例。内部代码需要自行保证 browserId 来源的可信性。
 
-### 11.7 本机链接权限问题汇总
+### 10.7 本机链接权限问题汇总
 
 | # | 问题 | 详情 | 严重度 |
 |---|------|------|--------|
@@ -713,11 +785,11 @@ socket = io(`http://localhost:5000/${browserId}`, {
 
 ---
 
-## 8. 总结
+## 11. 总结
 
 Maxun 的权限模型在同步 HTTP 路径上是清晰的 **用户级隔离**，但在异步和实时路径上存在大量 **"靠可信度而非强制校验"** 的软边界。
 
-### 8.1 三条路径的权限执行强度对比
+### 11.1 三条路径的权限执行强度对比
 
 | 路径 | 是否经过中间件 | 用户身份来源 | 数据查询是否带 userId | 整体信任级别 |
 |------|---------------|-------------|----------------------|------------|
@@ -725,7 +797,7 @@ Maxun 的权限模型在同步 HTTP 路径上是清晰的 **用户级隔离**，
 | **异步任务**（队列/调度/worker）| ❌ 绕过 | 任务 payload 中携带的 `userId` 字段 | ❌ Robot/Run 查询大多无联合条件 | 弱 |
 | **实时通道**（Socket.IO namespace）| ❌ 绕过 | ① 创建时闭包绑定的 userId ② 客户端 handshake.query 自报 | ⚠️ BrowserPool 内存查询按 userId，但 socket 连接本身无认证 | 中 |
 
-### 8.2 协同关系总结
+### 11.2 协同关系总结
 
 1. **HTTP 中间件层** 负责颁发身份（设置 `req.user`），这是唯一的强认证点。
 2. **路由 handler 层** 用 `req.user.id` 做数据过滤，这是主数据边界。
@@ -733,7 +805,7 @@ Maxun 的权限模型在同步 HTTP 路径上是清晰的 **用户级隔离**，
 4. **Socket 层** 把 `userId` 绑定为闭包变量，保证操作方向正确，但 **不验证连接者身份**——任何知道 browserId 的第三方都能以合法用户的身份发送输入。
 5. **Webhook 发送**、**孤儿恢复**、**队列轮询** 等后台自动进程在数据库层面做 **全表扫描**，不区分用户。它们的数据范围由入参（robotMetaId/runId/browserId）的来源可信度间接保证。
 
-### 8.3 改进优先级建议
+### 11.3 改进优先级建议
 
 | 优先级 | 措施 | 覆盖风险 |
 |--------|------|---------|
