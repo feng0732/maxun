@@ -21,7 +21,7 @@ Socket 事件并不是集中在一个地方注册的，而是分散在 **三个�
 
 ### 2.1 注册源 1：inputHandlers.ts —— 用户交互事件
 
-[inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts#L871-L912) `registerInputHandlers()` 注册所有**用户操作**相关的事件：
+[inputHandlers.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts#L871-L912) `registerInputHandlers()` 注册所有**用户操作**相关的事件：
 
 | Socket 事件 | 注册代码位置 | 处理函数 | 是否进入 workflow |
 |------------|------------|---------|-----------------|
@@ -40,11 +40,11 @@ Socket 事件并不是集中在一个地方注册的，而是分散在 **三个�
 | **`dom:keypress`** | **L885** | **`onDOMKeyboardAction` → `generator.onDOMKeyboardAction`** | **✓** |
 | `testPaginationScroll` | L886 | `onTestPaginationScroll` | —（测试用） |
 
-注册入口在 [connection.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/socket-connection/connection.ts#L17-L25)：每次客户端连接时自动调用 `registerInputHandlers(socket, userId)`。
+注册入口在 [connection.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/socket-connection/connection.ts#L17-L25)：每次客户端连接时自动调用 `registerInputHandlers(socket, userId)`。
 
 ### 2.2 注册源 2：Generator.ts —— 工作流元控制
 
-[Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L191-L257) 注册**工作流控制**相关的事件，包括模式切换、列表抓取配置、保存等：
+[Generator.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L191-L257) 注册**工作流控制**相关的事件，包括模式切换、列表抓取配置、保存等：
 
 | Socket 事件 | 注册位置 | 说明 |
 |------------|---------|------|
@@ -61,14 +61,26 @@ Socket 事件并不是集中在一个地方注册的，而是分散在 **三个�
 
 ### 2.3 注册源 3：RemoteBrowser.ts —— 浏览器状态同步
 
-[RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L221-L235) 注册**纯浏览器同步**事件，这些事件**不经过 Generator，也不产生 workflow 条目**：
+[RemoteBrowser.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts) 注册**纯浏览器同步**事件，这些事件**不经过 Generator，也不产生 workflow 条目**。
+
+注册分为两个阶段：
+
+**阶段一：初始化时注册（滚动监听）**
 
 | Socket 事件 | 注册位置 | 处理逻辑 | 是否进入 workflow |
 |------------|---------|---------|-----------------|
 | **`dom:scroll`** | **L228-L234** | **`page.mouse.wheel(deltaX, deltaY)`** 同步滚动位置 | **✗（只同步浏览器状态）** |
-| `captureDirectScreenshot` | L699 | 直接截图（人工操作） | ✗ |
-| `addTab` | L708 | 新增标签页 | ✗ |
-| `closeTab` | L716 | 关闭标签页 | ✗ |
+
+**阶段二：编辑器模式注册（`registerEditorEvents`，L694-L729）**
+
+| Socket 事件 | 注册位置 | 处理逻辑 | 是否进入 workflow |
+|------------|---------|---------|-----------------|
+| `captureDirectScreenshot` | L699 | 执行直接截图并返回结果 | ✗ |
+| `changeTab` | L703-L706 | 切换标签页 | ✗ |
+| `addTab` | L708-L714 | 新建标签页并切换 | ✗ |
+| `closeTab` | L716-L728 | 关闭指定标签页 | ✗ |
+
+> **关键区别**：注册源 3 的事件全部是**浏览器状态控制**，只操作 Playwright 浏览器本身，不涉及工作流生成。与注册源 1（用户交互→工作流）和注册源 2（工作流元控制）形成互补。
 
 ---
 
@@ -78,7 +90,7 @@ Socket 事件并不是集中在一个地方注册的，而是分散在 **三个�
 
 ### 3.1 发送端：前端 DOMBrowserRenderer.tsx wheelHandler
 
-[DOMBrowserRenderer.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L674-L728)
+[DOMBrowserRenderer.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L674-L728)
 
 ```
 wheel 事件触发
@@ -99,7 +111,7 @@ wheel 事件触发
 
 ### 3.2 接收端：服务端 RemoteBrowser.setupScrollEventListener
 
-[RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L221-L235)
+[RemoteBrowser.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L221-L235)
 
 ```typescript
 this.socket.on(
@@ -125,8 +137,8 @@ this.socket.on(
 
 | 模式 | 代码位置 | 实现方式 | 现状 |
 |------|---------|---------|------|
-| **DOM 模式** | [DOMBrowserRenderer.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx) | iframe + rrweb 事件流 + 前端直接监听 DOM 事件 | **当前默认启用** |
-| **Screenshot 模式** | [legacy/src/Canvas.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/legacy/src/Canvas.tsx) | Canvas 渲染截图 + 坐标映射 + Playwright 生成选择器 | **已弃用，代码移至 legacy/** |
+| **DOM 模式** | [DOMBrowserRenderer.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx) | iframe + rrweb 事件流 + 前端直接监听 DOM 事件 | **当前默认启用** |
+| **Screenshot 模式** | [legacy/src/Canvas.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/legacy/src/Canvas.tsx) | Canvas 渲染截图 + 坐标映射 + Playwright 生成选择器 | **已弃用，代码移至 legacy/** |
 
 ### 4.2 Screenshot 模式的工作原理（仅供参考，已不再使用）
 
@@ -141,7 +153,7 @@ socket.emit('input:mousedown', browserCoordinates)
 （服务端注册缺失？→ 搜索全项目无 input:mousedown 监听）
 ```
 
-**遗留的服务端接口**：`Generator.ts` 中仍然保留了对应的 [onClick(coordinates, page)](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L511) 方法，其核心逻辑：
+**遗留的服务端接口**：`Generator.ts` 中仍然保留了对应的 [onClick(coordinates, page)](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L511) 方法，其核心逻辑：
 
 ```typescript
 // Generator.ts L511 —— 仅在截图模式下理论可调用
@@ -163,8 +175,8 @@ public onClick = async (coordinates: Coordinates, page: Page) => {
 - 全项目搜索 `input:mousedown`、`input:keydown`、`input:wheel`：**仅存在于 legacy/Canvas.tsx**，服务端无监听
 - `generator.onClick()` 方法：**无任何调用者**（全文搜索仅找到定义处，代码引用处仅文档）
 - `screenshot-mode-enabled` 事件：前端无发送，仅服务端留有监听 stub
-- `isDOMMode` 初始值：服务端 `false`，但 [BrowserWindow.tsx L186-L194](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/browser/BrowserWindow.tsx#L186-L194) 中前端收到 `dom-mode-enabled` 后立刻回发确认，实际运行中默认启用 DOM 模式
-- [BrowserWindow.tsx L2002-L2135](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/browser/BrowserWindow.tsx#L2002-L2135)：`isDOMMode ? <DOMBrowserRenderer /> : <DOMLoadingIndicator />`，非 DOM 模式只显示加载指示器
+- `isDOMMode` 初始值：服务端 `false`，但 [BrowserWindow.tsx L186-L194](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/browser/BrowserWindow.tsx#L186-L194) 中前端收到 `dom-mode-enabled` 后立刻回发确认，实际运行中默认启用 DOM 模式
+- [BrowserWindow.tsx L2002-L2135](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/browser/BrowserWindow.tsx#L2002-L2135)：`isDOMMode ? <DOMBrowserRenderer /> : <DOMLoadingIndicator />`，非 DOM 模式只显示加载指示器
 
 **结论**：Screenshot 模式是**历史遗留的架构设计**，当前版本中：
 - 前端已无 Screenshot 模式的 UI 入口
@@ -281,7 +293,7 @@ public onClick = async (coordinates: Coordinates, page: Page) => {
 
 ### 5.2 前端生成选择器：mouseDownHandler 详细流程
 
-[DOMBrowserRenderer.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx)
+[DOMBrowserRenderer.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx)
 
 ```
 用户在 iframe 内 mousedown
@@ -331,7 +343,7 @@ public onClick = async (coordinates: Coordinates, page: Page) => {
 
 **第一层：inputHandlers.ts handleClickAction**
 
-[inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts)
+[inputHandlers.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts)
 
 ```
 onDOMClickAction(data, userId)
@@ -352,7 +364,7 @@ onDOMClickAction(data, userId)
 
 **第二层：Generator.ts onDOMClickAction**
 
-[Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L426-L458)
+[Generator.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L426-L458)
 
 ```typescript
 // ⭐ 重点：此处不重新生成选择器！直接消费 data.selector
@@ -390,7 +402,7 @@ public onDOMClickAction = async (page, data) => {
 
 ### 5.4 addPairToWorkflowAndNotifyClient：选择器的最终归宿
 
-[Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L295-L344)
+[Generator.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L295-L344)
 
 ```
 addPairToWorkflowAndNotifyClient(pair, page)
@@ -417,13 +429,22 @@ addPairToWorkflowAndNotifyClient(pair, page)
 
 ## 六、完整 Socket 事件清单（全项目汇总）
 
-### 6.1 前端 → 服务端（录制相关）
+### 6.1 分类总览
+
+| 类别 | 说明 | 进入 workflow |
+|------|------|-------------|
+| **录制交互事件** | `dom:click`、`dom:keypress`、`input:url` 等用户操作 | ✓（核心） |
+| **浏览器同步事件** | `dom:scroll`、`changeTab`、`captureDirectScreenshot` 等纯浏览器控制 | ✗ |
+| **浏览器状态通知** | `rrweb-event`、`urlChanged`、`domLoadingProgress` 等状态推送 | ✗ |
+| **工作流元控制** | `save`、`new-recording`、`decision` 等工作流管理 | ✗（间接影响） |
+| **列表抓取配置** | `setGetList`、`listSelector`、`setPaginationMode` | ✗ |
+
+### 6.2 前端 → 服务端（录制交互类）
 
 | 事件名 | 发送位置 | 载荷 | 服务端处理 | 进入 workflow |
 |--------|---------|------|-----------|-------------|
-| `dom:click` | DOMBrowserRenderer L569 | `{ selector, userId, elementInfo, coordinates?, isSPA? }` | inputHandlers → Generator.onDOMClickAction | ✓ |
-| `dom:keypress` | DOMBrowserRenderer L642 | `{ selector, key, userId, inputType? }` | inputHandlers → Generator.onDOMKeyboardAction | ✓ |
-| `dom:scroll` | DOMBrowserRenderer L724 | `{ deltaX, deltaY }` | RemoteBrowser → page.mouse.wheel | ✗ |
+| `dom:click` | [DOMBrowserRenderer.tsx L569](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L569-L583) | `{ selector, userId, elementInfo, coordinates?, isSPA? }` | inputHandlers → Generator.onDOMClickAction | ✓ |
+| `dom:keypress` | [DOMBrowserRenderer.tsx L642](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L642-L647) | `{ selector, key, userId, inputType? }` | inputHandlers → Generator.onDOMKeyboardAction | ✓ |
 | `input:url` | URL 表单或导航 | `string` (url) | inputHandlers → onChangeUrl | ✓ |
 | `input:refresh` | 浏览器刷新按钮 | 无 | inputHandlers → onRefresh | ✓ |
 | `input:back` | 后退按钮 | 无 | inputHandlers → onGoBack | ✓ |
@@ -433,35 +454,66 @@ addPairToWorkflowAndNotifyClient(pair, page)
 | `input:datetime-local` | 日期时间选择器 | `{ selector, value }` | inputHandlers → onDateTimeLocalSelection | ✓ |
 | `input:dropdown` | 下拉选择器确认 | `{ selector, value }` | inputHandlers → onDropdownSelection | ✓ |
 | `input:keyup` | 按键释放 | `key: string` | inputHandlers → onKeyup | ✗ |
-| `dom-mode-enabled` | BrowserWindow L190 | 无（ACK） | Generator → isDOMMode = true | ✗ |
-| `setGetList` | 前端列表开关 | `{ getList: boolean }` | Generator → 更新状态 | ✗ |
-| `listSelector` | 前端选择列表容器 | `{ selector: string }` | Generator → 更新状态 | ✗ |
-| `setPaginationMode` | 前端分页开关 | `{ pagination: boolean }` | Generator → 更新状态 | ✗ |
-| `save` | 保存按钮 | `{ fileName, userId, isLogin, robotId }` | Generator → saveNewWorkflow | ✗（持久化） |
-| `new-recording` | 新建录制 | 无 | Generator → 清空 workflow | ✗ |
-| `activeIndex` | 选中步骤 | `string` (index) | Generator → lastIndex | ✗ |
-| `decision` | 用户确认弹窗 | `{ pair, actionType, decision, userId }` | Generator → 调整 pair | ✗ |
-| `updatePair` | 手动编辑步骤 | `{ index, pair }` | Generator → updatePairInWorkflow | ✗ |
 | `action` | 手动添加动作 | `{ action, url, selectors, args }` | inputHandlers → onGenerateAction | ✓ |
-| `removeAction` | 手动删除动作 | `{ pairIndex, actionIndex }` | inputHandlers → onRemoveAction | ✗（workflow 修改） |
+| `removeAction` | 手动删除动作 | `{ pairIndex, actionIndex }` | inputHandlers → onRemoveAction | ✗（修改） |
 | `testPaginationScroll` | 分页测试 | 配置参数 | inputHandlers → onTestPaginationScroll | ✗ |
 
-### 6.2 服务端 → 前端（录制相关）
+### 6.3 前端 → 服务端（浏览器同步类）
+
+> 这类事件**不经过 Generator**，直接由 `RemoteBrowser` 处理，只操作 Playwright 浏览器本身。
+
+| 事件名 | 发送方 | 载荷 | 服务端注册位置 | 处理逻辑 | 进入 workflow |
+|--------|-------|------|--------------|---------|-------------|
+| `dom:scroll` | DOMBrowserRenderer wheelHandler | `{ deltaX, deltaY }` | [RemoteBrowser.ts L228-L234](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L228-L234) | `page.mouse.wheel()` 同步滚动 | ✗ |
+| `captureDirectScreenshot` | 前端截图按钮 | settings 对象 | [RemoteBrowser.ts L699-L701](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L699-L701) | 执行截图并回发结果 | ✗ |
+| `changeTab` | 前端标签页切换 | tabIndex: number | [RemoteBrowser.ts L703-L706](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L703-L706) | 切换当前 page | ✗ |
+| `addTab` | 前端新建标签页 | 无 | [RemoteBrowser.ts L708-L714](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L708-L714) | `context.newPage()` + 切换 | ✗ |
+| `closeTab` | 前端关闭标签页 | `{ index, isCurrent }` | [RemoteBrowser.ts L716-L728](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L716-L728) | 关闭 page + 切换当前页 | ✗ |
+
+### 6.4 服务端 → 前端（浏览器状态通知类）
 
 | 事件名 | 发送位置 | 载荷 | 说明 |
 |--------|---------|------|------|
-| `rrweb-event` | RemoteBrowser L357 | rrweb 事件对象 | DOM 模式实时页面渲染 |
-| `domLoadingProgress` | RemoteBrowser L237 | `{ progress, pendingRequests, userId }` | 页面加载进度 |
-| `dom-mode-enabled` | RemoteBrowser 初始化成功后 | `{ userId }` | 通知前端 DOM 模式已就绪 |
-| `dom-mode-error` | rrweb 初始化失败 | `{ userId, error }` | 通知前端 DOM 模式失败 |
-| `workflow` | Generator.addPairToWorkflow... | `WorkflowFile` | 工作流更新通知 |
-| `highlighter` | 元素悬停检测 | `{ rect, selector, elementInfo, isDOMMode, shadowInfo }` | 元素高亮 |
-| `showDropdown` | Generator.onClick L546 | `{ coordinates, selector, options }` | 显示下拉选择器 |
-| `showDatePicker` | Generator.onClick L557 | `{ coordinates, selector }` | 显示日期选择器 |
-| `showTimePicker` | Generator.onClick L567 | `{ coordinates, selector }` | 显示时间选择器 |
-| `showDateTimePicker` | Generator.onClick L577 | `{ coordinates, selector }` | 显示日期时间选择器 |
-| `urlChanged` | RemoteBrowser L265 | `{ url, userId }` | 页面 URL 变化通知 |
-| `paginationScrollTestResult` | inputHandlers L724+ | 测试结果 | 分页滚动测试结果 |
+| `rrweb-event` | [RemoteBrowser.ts L357](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L357) | rrweb 事件对象 | DOM 模式实时页面渲染（核心数据通道） |
+| `domLoadingProgress` | [RemoteBrowser.ts L237-L244](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L237-L244) | `{ progress, pendingRequests, userId }` | 页面加载进度（0-100） |
+| `dom-snapshot-loading` | [RemoteBrowser.ts L466](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L466) | 加载状态 | DOM 快照加载中通知 |
+| `urlChanged` | [RemoteBrowser.ts L265](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L265) + [L921](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L921) | `{ url, userId }` | 页面 URL 变化通知（导航/切标签页均触发） |
+| `dom-mode-enabled` | controller 初始化成功后 | `{ userId }` | 通知前端 DOM 模式已就绪 |
+| `dom-mode-error` | [controller.ts L50](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/controller.ts#L50) | `{ userId, error }` | 通知前端 DOM 模式初始化失败 |
+| `screenshotCaptureStarted` | [RemoteBrowser.ts L637](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L637) | 状态信息 | 截图开始通知 |
+| `directScreenshotCaptured` | [RemoteBrowser.ts L655](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L655) | 截图数据 + metadata | 直接截图完成（返回 base64） |
+| `screenshotError` | [RemoteBrowser.ts L629](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L629) + [L664](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L664) | 错误信息 | 截图失败通知 |
+
+### 6.5 服务端 → 前端（工作流与 UI 类）
+
+| 事件名 | 发送位置 | 载荷 | 说明 |
+|--------|---------|------|------|
+| `workflow` | [Generator.ts L342](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L342) | `WorkflowFile` | 工作流更新通知（每次 pair 变化都发） |
+| `highlighter` | [Generator.ts L1205-L1210](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L1205-L1210) | `{ rect, selector, elementInfo, isDOMMode, shadowInfo }` | 元素悬停高亮数据 |
+| `showDropdown` | [Generator.ts L546](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L546) | `{ coordinates, selector, options }` | 显示下拉选择器弹窗 |
+| `showDatePicker` | [Generator.ts L557](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L557) | `{ coordinates, selector }` | 显示日期选择器弹窗 |
+| `showTimePicker` | [Generator.ts L567](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L567) | `{ coordinates, selector }` | 显示时间选择器弹窗 |
+| `showDateTimePicker` | [Generator.ts L577](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L577) | `{ coordinates, selector }` | 显示日期时间选择器弹窗 |
+| `decision` | [Generator.ts L824](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L824) | `{ pair, actionType, ... }` | 需要用户决策（如 over-shadowing 确认） |
+| `fileSaved` | [Generator.ts L1077](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L1077) + L1087 + L1120 + L1127 | `{ actionType }` | 工作流保存结果通知 |
+| `newTab` | [Generator.ts L1241](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L1241) | 页面标题 / 'new tab' | 新标签页通知 |
+| `tabHasBeenClosed` | [Generator.ts L1237](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L1237) | pageIndex | 标签页已关闭通知 |
+| `paginationScrollTestResult` | [inputHandlers.ts L724](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts#L724) | 测试结果 | 分页滚动测试结果 |
+
+### 6.6 工作流元控制（前端 → 服务端）
+
+| 事件名 | 注册位置 | 说明 | 进入 workflow |
+|--------|---------|------|-------------|
+| `setGetList` | [Generator.ts L192](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L192) | 设置列表抓取模式 | ✗ |
+| `listSelector` | [Generator.ts L195](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L195) | 指定列表容器选择器 | ✗ |
+| `setPaginationMode` | [Generator.ts L198](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L198) | 开启分页检测模式 | ✗ |
+| `dom-mode-enabled` | [Generator.ts L204](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L204) | DOM 模式确认（前端回发 ACK） | ✗ |
+| `screenshot-mode-enabled` | [Generator.ts L209](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L209) | Screenshot 模式切换（当前未使用） | ✗ |
+| `save` | [Generator.ts L221](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L221) | 保存工作流到数据库 | ✗（持久化） |
+| `new-recording` | [Generator.ts L226](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L226) | 重置工作流为空 | ✗ |
+| `activeIndex` | [Generator.ts L231](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L231) | 更新当前选中步骤索引 | ✗ |
+| `decision` | [Generator.ts L232](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L232) | 用户决策反馈 | ✗ |
+| `updatePair` | [Generator.ts L254](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts#L254) | 用户手动编辑 pair | ✗ |
 
 ---
 
@@ -489,13 +541,14 @@ addPairToWorkflowAndNotifyClient(pair, page)
 
 | 文件 | 端 | 核心职责 |
 |------|----|---------|
-| [src/components/recorder/DOMBrowserRenderer.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx) | 前端 | DOM 模式录制组件：iframe 事件监听 + **选择器生成** + Socket 发送 |
-| [src/components/browser/BrowserWindow.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/browser/BrowserWindow.tsx) | 前端 | 浏览器窗口容器：DOM 模式切换、全局状态管理 |
-| [src/helpers/clientSelectorGenerator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) | 前端 | 客户端选择器生成器：单例类 + @medv/finder 算法 + 分组算法 |
-| [server/src/socket-connection/connection.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/socket-connection/connection.ts) | 服务端 | Socket 连接入口：注册 inputHandlers |
-| [server/src/browser-management/inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts) | 服务端 | **注册源 1**：用户交互事件路由 + Playwright 动作执行 |
-| [server/src/browser-management/classes/RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts) | 服务端 | **注册源 3**：滚动同步 + rrweb 录制 + 标签页管理 |
-| [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts) | 服务端 | **注册源 2**：模式切换 + 工作流编排器：事件 → Where-What Pair |
-| [server/src/workflow-management/selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) | 服务端 | 服务端选择器生成（page.evaluate 注入，SDK/历史用） |
-| [server/src/workflow-management/utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/utils.ts) | 服务端 | 选择器优先级决策（多策略选优） |
-| [legacy/src/Canvas.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/legacy/src/Canvas.tsx) | 前端（遗留） | 旧 Screenshot 模式：Canvas 坐标 + input:mousedown 发送 |
+| [src/components/recorder/DOMBrowserRenderer.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx) | 前端 | DOM 模式录制组件：iframe 事件监听 + **选择器生成** + Socket 发送 |
+| [src/components/browser/BrowserWindow.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/browser/BrowserWindow.tsx) | 前端 | 浏览器窗口容器：DOM 模式切换、全局状态管理 |
+| [src/helpers/clientSelectorGenerator.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) | 前端 | 客户端选择器生成器：单例类 + @medv/finder 算法 + 分组算法 |
+| [server/src/socket-connection/connection.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/socket-connection/connection.ts) | 服务端 | Socket 连接入口：注册 inputHandlers |
+| [server/src/browser-management/controller.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/controller.ts) | 服务端 | 浏览器控制器：创建/销毁 RemoteBrowser、DOM 模式初始化 |
+| [server/src/browser-management/inputHandlers.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts) | 服务端 | **注册源 1**：用户交互事件路由 + Playwright 动作执行 |
+| [server/src/browser-management/classes/RemoteBrowser.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/classes/RemoteBrowser.ts) | 服务端 | **注册源 3**：滚动同步 + rrweb 录制 + 标签页/截图管理 |
+| [server/src/workflow-management/classes/Generator.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts) | 服务端 | **注册源 2**：模式切换 + 工作流编排器：事件 → Where-What Pair |
+| [server/src/workflow-management/selector.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) | 服务端 | 服务端选择器生成（page.evaluate 注入，SDK/历史用） |
+| [server/src/workflow-management/utils.ts](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/utils.ts) | 服务端 | 选择器优先级决策（多策略选优） |
+| [legacy/src/Canvas.tsx](file:///D:/fz/0601-2/solo-dogfeeding/code/106-maxun/legacy/src/Canvas.tsx) | 前端（遗留） | 旧 Screenshot 模式：Canvas 截图 + 坐标映射 + input:mousedown 发送 |
