@@ -316,115 +316,237 @@ schedule-worker (每 30s)        Graphile Worker               scheduler/index.t
 
 ---
 
-## 5. Webhook 回调触发点全览
+## 5. Webhook 触发点全览（核准统计口径）
 
-系统共 **10 处** `sendWebhook()` 调用，覆盖 4 个文件、所有执行路径、两种结果状态。
+本系统的 webhook 调用需要从 **三个层次** 进行统计，不可混淆：
 
-### 5.1 触发点位置索引
+| 统计口径 | 含义 | 数量 | 核心函数 |
+|----------|------|------|----------|
+| **① 运行结束回调调用点** | 业务代码中调用 `sendWebhook()` 分发器的位置 | **13 处** | `sendWebhook(robotId, eventType, data)` |
+| **② 测试接口直接发送** | 测试接口绕过分发器，直接 axios.post | **1 处** | `axios.post(webhook.url, testPayload)` |
+| **③ 实际 HTTP 投递次数** | 每个匹配 webhook URL 的发送（含重试） | **动态** | `sendWebhookWithRetry()` |
 
-| # | 文件 | 行号 | 事件类型 | 触发路径 | 场景 |
-|---|------|------|----------|----------|------|
-| 1 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts) | L353-L361 | `run_completed` | UI/Worker | scrape 类型成功 |
-| 2 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts) | L492-L506 | `run_completed` | UI/Worker | extract/crawl/search 成功 |
-| 3 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts) | L542-L549 | `run_failed` | UI/Worker | 执行失败（内层 catch） |
-| 4 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts) | L566-L572 | `run_failed` | UI/Worker | 执行失败（外层 catch） |
-| 5 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts) | L1017 | `run_completed` | API/SDK/MCP | scrape 类型成功 |
-| 6 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts) | L1279-L1306 | `run_completed` | API/SDK/MCP | extract/crawl/search 成功 |
-| 7 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts) | L1079-L1093 | `run_failed` | API/SDK/MCP | scrape 类型失败 |
-| 8 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts) | L1358-L1381 | `run_failed` | API/SDK/MCP | extract/crawl/search 失败 |
-| 9 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/workflow-management/scheduler/index.ts) | L492 | `run_completed` | 定时调度 | scrape 类型成功 |
-| 10 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/workflow-management/scheduler/index.ts) | L748-L753 | `run_completed` | 定时调度 | extract/crawl/search 成功 |
-| 11 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/workflow-management/scheduler/index.ts) | L798-L803 | `run_failed` | 定时调度 | 执行失败（main catch） |
-| 12 | [executeDocumentRun.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentRun.ts) | L67-L73 | `run_completed` | API/定时调度 | doc-extract 成功 |
-| 13 | [executeDocumentParseRun.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentParseRun.ts) | L52-L62 | `run_completed` | API/定时调度 | doc-parse 成功 |
-| 14 | [webhook.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts) | L490 | `webhook_test` | UI 测试 | 手动测试调用 |
-
-> **共 14 处**调用点（含 webhook 测试）。
-
-### 5.2 Webhook 发送时机与状态变化的关系
-
-```
-Run.status 变化                sendWebhook() 调用点
-─────────────────               ──────────────────────
-
-创建阶段:
-  'scheduled' (定时)            ── 不发送 webhook
-  'queued'    (UI槽位不足)      ── 不发送 webhook
-  'running'                     ── 不发送 webhook
-
-执行结束:
-  ┌─ 'success' ────────────────► sendWebhook('run_completed')  ← 12 处触发点
-  │                              (task-runner, api/record, scheduler, doc*)
-  │
-  └─ 'failed'  ────────────────► sendWebhook('run_failed')     ← 5 处触发点
-                                 (task-runner×2, api/record×2, scheduler)
-
-中止:
-  'aborting' → 'aborted'        ── 不发送 webhook  ← 注意：中止没有 webhook！
-                                 (见 task-runner.ts#L414-L418 abortRun() 中无 sendWebhook)
-```
-
-### 5.3 文档机器人的特殊情况
-
-| 场景 | 是否发送 webhook | 代码位置 |
-|------|------------------|----------|
-| doc-extract 成功 | ✅ 发送 | [executeDocumentRun.ts#L67-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentRun.ts#L67-L73) |
-| doc-extract 失败 | ❌ 不发送 | [executeDocumentRun.ts#L77-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentRun.ts#L77-L101) （仅 Socket 通知，无 webhook） |
-| doc-parse 成功 | ✅ 发送 | [executeDocumentParseRun.ts#L52-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentParseRun.ts#L52-L62) |
-| doc-parse 失败 | ❌ 不发送 | [executeDocumentParseRun.ts#L63-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentParseRun.ts#L63-L87) （仅 Socket 通知，无 webhook） |
+> **核心概念**：`sendWebhook()` 是**分发器**，不是实际发送函数。它查询配置 → 过滤匹配的 webhook → 对每个 URL 调用 `sendWebhookWithRetry()`（实际 HTTP 发送）。因此「13 处运行结束回调」并不等于「13 次 HTTP 请求」，实际请求数取决于该 Robot 配置了多少个 active 的、订阅对应事件的 webhook。
 
 ---
 
-## 6. sendWebhook 分发与重试机制
+### 5.1 口径①：运行结束回调调用点（13 处）
 
-### 6.1 sendWebhook 核心逻辑
+这些是业务流程结束时调用 `sendWebhook()` 分发器的位置，分布在 6 个文件中。
 
-**文件**：[routes/webhook.ts#L404-L465](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L404-L465)
+#### 5.1.1 成功事件 `run_completed`（8 处）
+
+| # | 文件 | 行号 | 触发路径 | 场景 |
+|---|------|------|----------|------|
+| 1 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts#L358) | L358 | UI/Worker | scrape 类型成功（页面转 Markdown 等） |
+| 2 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts#L493) | L493 | UI/Worker | extract/crawl/search 类型成功 |
+| 3 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts#L1017) | L1017 | API/SDK/MCP | scrape 类型成功 |
+| 4 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts#L1302) | L1302 | API/SDK/MCP | extract/crawl/search 类型成功 |
+| 5 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/workflow-management/scheduler/index.ts#L492) | L492 | 定时调度 | scrape 类型成功 |
+| 6 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/workflow-management/scheduler/index.ts#L749) | L749 | 定时调度 | extract/crawl/search 类型成功 |
+| 7 | [executeDocumentRun.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentRun.ts#L67) | L67 | API/定时调度 | doc-extract（PDF 数据抽取）成功 |
+| 8 | [executeDocumentParseRun.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/utils/document/executeDocumentParseRun.ts#L53) | L53 | API/定时调度 | doc-parse（PDF 格式转换）成功 |
+
+**成功事件小计：8 处**
+
+#### 5.1.2 失败事件 `run_failed`（5 处）
+
+| # | 文件 | 行号 | 触发路径 | 场景 |
+|---|------|------|----------|------|
+| 1 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts#L543) | L543 | UI/Worker | 执行失败（内层 catch：scrape 转换失败 / InterpretRecording 抛错） |
+| 2 | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/task-runner.ts#L567) | L567 | UI/Worker | 执行失败（外层 catch：浏览器准备阶段异常 / 未预期异常） |
+| 3 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts#L1080) | L1080 | API/SDK/MCP | scrape 类型失败 |
+| 4 | [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/api/record.ts#L1377) | L1377 | API/SDK/MCP | extract/crawl/search 类型失败 |
+| 5 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/workflow-management/scheduler/index.ts#L799) | L799 | 定时调度 | 执行失败（main catch：所有类型异常汇总） |
+
+**失败事件小计：5 处**
+
+> **总计**：成功 8 + 失败 5 = **13 处运行结束回调**
+
+---
+
+### 5.2 口径②：测试接口直接发送（1 处）
+
+**位置**：[webhook.ts#L356-L361](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L356-L361)
+
+**注意**：测试接口 **不经过 `sendWebhook()` 分发器**，而是绕过它直接发送：
+
+```typescript
+// webhook.ts#L356-L361
+await updateWebhookLastCalled(robotId, webhook.id);
+
+const response = await axios.post(webhook.url, testPayload, {
+    timeout: (webhook.timeout || 30) * 1000,
+    validateStatus: (status) => status < 500
+});
+```
+
+特点：
+- 事件类型固定为 `event_type: "webhook_test"`（在 payload 中硬编码，不是 `sendWebhook()` 的 eventType 参数）
+- **没有重试逻辑**（只发 1 次，失败立即返回给用户）
+- 只发给用户指定的**单个** webhook URL（不是所有匹配配置）
+
+---
+
+### 5.3 口径③：实际 HTTP 投递（动态数量）
+
+**函数**：`sendWebhookWithRetry(robotId, webhook, payload, attempt)` [webhook.ts#L437](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L437)
+
+每次业务调用 `sendWebhook()` 时的实际 HTTP 请求数：
+
+```
+实际 HTTP 请求数 = (匹配的 active webhook 数量) × (1 + 重试次数)
+```
+
+其中：
+- **匹配数量**：`robot.webhooks` 中满足 `w.active === true && w.events.includes(eventType)` 的数量
+- **重试次数**：0 ~ `webhook.retryAttempts - 1`（默认最多重试 2 次，合计发 3 次）
+- **退避策略**：5s → 10s → 20s（指数退避）
+
+---
+
+### 5.4 调用层级关系图
+
+```
+业务代码（13 处运行结束回调）               + 测试接口（1 处直接发送）
+       │                                            │
+       ▼                                            │
+sendWebhook(robotId, eventType, data)               │
+  [webhook.ts#L404]  ───────────────────────┐       │
+       │                                     │       │
+       ├─ 1. Robot.findOne() → webhooks[]   │       │
+       ├─ 2. 过滤 active + events 匹配       │       │
+       ├─ 3. Promise.allSettled() 并发       │       │
+       │   N 次（N = 匹配 webhook 数）       │       │
+       ▼                                     ▼       ▼
+sendWebhookWithRetry()               axios.post(testPayload)
+  [webhook.ts#L437]                  [webhook.ts#L358]
+       │
+       ├─ axios.post(webhook.url)   ←── 这才是实际 HTTP 请求
+       └─ 若失败: setTimeout → 递归调用自己（最多 3 次）
+```
+
+---
+
+### 5.5 Webhook 发送时机与状态变化的关系
+
+```
+Run.status 变化                     触发 sendWebhook()?     事件类型
+─────────────────                   ──────────────────     ──────────
+
+创建阶段:
+  'scheduled' (定时)                 ── 否 ──              —
+  'queued'    (UI槽位不足)           ── 否 ──              —
+  'running'                          ── 否 ──              —
+
+执行结束:
+  ┌─ 'success'                      ── 是（8 处）──       run_completed
+  │                                    task-runner×2
+  │                                    api/record×2
+  │                                    scheduler×2
+  │                                    executeDocument×2
+  │
+  └─ 'failed'                       ── 是（5 处）──       run_failed
+                                       task-runner×2
+                                       api/record×2
+                                       scheduler×1
+
+中止:
+  'aborting' → 'aborted'             ── 否 ──              —
+                                     （abortRun() 中无 sendWebhook
+                                       见 task-runner.ts#L584-L628）
+
+文档机器人注意事项:
+  doc-extract/doc-parse → success    ── 是 ──             run_completed
+  doc-extract/doc-parse → failed     ── 否 ──             （代码缺失，
+                                                             仅有 Socket 通知）
+```
+
+### 5.6 成功/失败事件数量汇总
+
+| 统计维度 | 数量 |
+|----------|------|
+| `run_completed`（成功）回调点 | **8 处** |
+| `run_failed`（失败）回调点 | **5 处** |
+| 运行结束回调合计 | **13 处** |
+| 测试接口直接发送 | **1 处**（不计入运行结束回调） |
+| 不含 webhook 的状态分支 | `aborted`、`doc-* failed`（2 处缺口） |
+
+---
+
+## 6. sendWebhook 分发器与 sendWebhookWithRetry 实际发送
+
+### 6.1 sendWebhook() — 分发器（无实际 HTTP 调用）
+
+**文件**：[webhook.ts#L404-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L404-L434)
+
+`sendWebhook()` 本身不做 HTTP 请求，它是一个「查询 + 过滤 + 分发」的协调器：
 
 ```
 sendWebhook(robotMetaId, eventType, data)
   │
   ├─ 1. Robot.findOne({ where: { 'recording_meta.id': robotMetaId } })
-  │     → 取出 recording_meta.webhooks[]
+  │     → 取出 recording_meta.webhooks[] （JSONB 数组）
   │
-  ├─ 2. 过滤 webhook:
+  ├─ 2. 过滤 activeWebhooks:
   │     w.active === true
   │     AND eventType ∈ w.events
+  │     → 无匹配则静默 return（不打日志）
   │
   ├─ 3. 对每个匹配 webhook 构建完整 payload:
   │     {
-  │       event_type: eventType,
-  │       timestamp: new Date().toISOString(),
+  │       event_type: eventType,      // 'run_completed' | 'run_failed'
+  │       timestamp: ISO8601,
   │       webhook_id: webhook.id,
-  │       data: data  ← 调用方传入的数据
+  │       data: data                 // 调用方传入（各路径不同）
   │     }
   │
   ├─ 4. Promise.allSettled() 并行调用 sendWebhookWithRetry()
+  │     → 每个 active webhook URL 走独立的重试逻辑
   │
-  └─ 5. 所有错误仅 logger.log('warn'/'error')，不抛出异常
-       → webhook 失败不影响 Run 状态（已持久化 success/failed）
+  └─ 5. 所有错误仅 console.error()，不抛出异常
+       → webhook 失败不影响主流程（Run 状态已持久化）
 ```
 
-### 6.2 重试与超时
+### 6.2 sendWebhookWithRetry() — 实际 HTTP 投递
 
-`sendWebhookWithRetry(robotMetaId, webhook, payload, attempt)`：
+**文件**：[webhook.ts#L437-L465](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L437-L465)
 
-- **超时**：`webhook.timeout || 30` 秒（axios config.timeout）
-- **最大重试**：`webhook.retryAttempts || 3` 次
-- **退避策略**：指数退避 `retryDelay * 2^(attempt-1)` 秒
-  - 第 1 次失败 → 等 `5s` → 第 2 次
-  - 第 2 次失败 → 等 `10s` → 第 3 次
-  - 第 3 次失败 → 放弃，打 error 日志
-- **状态更新**：每次尝试前 `Robot.update()` 更新 `webhooks[].lastCalledAt = now()`
+这是真正执行 `axios.post()` 的函数，带重试逻辑：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `timeout` | 30s | axios 超时（毫秒） |
+| `retryAttempts` | 3 次 | 最多发送次数（含首次） |
+| `retryDelay` | 5s | 基础退避时间 |
+| 退避公式 | `retryDelay × 2^(attempt-1)` | 指数退避：5s → 10s → 20s |
+
+**执行流程**：
+```
+sendWebhookWithRetry(robotId, webhook, payload, attempt=1)
+  │
+  ├─ 1. updateWebhookLastCalled()  ← 每次尝试都更新 lastCalledAt（即使失败）
+  │
+  ├─ 2. axios.post(webhook.url, payload, { timeout, ... })
+  │
+  ├─ 3. 成功 → return
+  │
+  └─ 4. 失败:
+       ├─ attempt < retryAttempts → setTimeout(sendWebhookWithRetry(...), delay × 1000)
+       │    （递归 setTimeout，不阻塞 sendWebhook 的 Promise.allSettled）
+       └─ 已达最大重试 → console.error() 放弃
+```
+
+> **注意**：重试使用 `setTimeout` 异步调度，因此 `sendWebhook()` 返回的 Promise 只等待**首次发送**完成，后续重试在后台继续。HTTP 响应返回给 API 客户端时，重试可能还在进行。
 
 ---
 
 ## 7. REST API 请求-Webhook 回调时间轴
 
-以 `POST /api/robots/:id/runs`（scrape 类型机器人）为例，精确时序：
+以 `POST /api/robots/:id/runs`（scrape 类型机器人，Robot 配置了 2 个 active 的 `run_completed` webhook）为例，精确时序区分三层调用：
 
 ```
-时间轴 (ms)      事件                                   Run.status         Webhook
+时间轴 (ms)      事件                                   Run.status         层级
 ──────────      ──────────────────────────────────     ──────────         ───────
 T=0             客户端发起请求
 T≈20            requireAPIKey 校验通过
@@ -434,29 +556,37 @@ T≈100           Socket.IO 连接建立
 T≈2000          浏览器启动完成 → 'ready-for-run'
 T≈2010          executeRun() 开始执行
                  ├─ Run.update(status='running')       (已是 running)
-                 └─ 开始页面转换...
+                 └─ 开始页面格式转换...
 T≈5000          Markdown/HTML/截图等转换完成
                  ├─ Run.update(status='success')    ──► 'success'
                  ├─ MinIO 上传截图
                  ├─ Socket.IO emit('run-completed')
-                 └─ sendWebhook('run_completed')  ────────┐
-T≈5050                                                      │
-                 sendWebhook 内部:                           │
-                 ├─ 查询 Robot.webhooks[]                   │
-                 ├─ 过滤 active + 匹配 events               │
-                 └─ Promise.allSettled → axios.post()  ─────┼──► 第三方 Webhook URL
-T≈5100          waitForRunCompletion() 轮询 DB               │
-                 → 检测到 status='success'                  │
-T≈5105          返回 HTTP 200                                │
-                                                            │ (异步)
-T≈5200          第三方收到 webhook 请求 ◄────────────────────┘
-T≈5250          第三方返回 2xx OK
+                 └─ sendWebhook('run_completed')  ──── ① 分发器调用 (api/record.ts#L1017)
+T≈5050           ├─ Robot.findOne() → 找到 2 个匹配 webhook
+T≈5060           ├─ Promise.allSettled() 并发派发        │
+T≈5061           ├─ sendWebhookWithRetry(webhook A)  ── ② 首次实际发送
+T≈5061           └─ sendWebhookWithRetry(webhook B)  ── ② 首次实际发送
+T≈5070                ├─ axios.post(webhookA.url)         ├──► 第三方 A
+T≈5070                └─ axios.post(webhookB.url)         ├──► 第三方 B
+T≈5100          waitForRunCompletion() 轮询 DB
+                 → 检测到 status='success'                  (webhook 仍在飞行中)
+T≈5105          返回 HTTP 200                              (sendWebhook() 此时尚未 resolve)
+                                                              │
+T≈5180          第三方 B 返回 200 OK ◄───────────────────────┘
+T≈5200          第三方 A 超时 / 500 / ECONNREFUSED ◄───────┘
+T≈5201           └─ setTimeout(sendWebhookWithRetry(A), 5s)   ③ 第1次重试排期
+T≈10201         sendWebhookWithRetry(A, attempt=2)        ── ③ 第1次重试实际发送
+T≈10201           └─ axios.post(webhookA.url)              ├──► 第三方 A
+T≈10250          第三方 A 返回 200 OK ◄──────────────────────┘
+                 (所有 webhook 最终完成)
 ```
 
 **关键点**：
-1. HTTP 响应和 webhook 是**异步**的 —— HTTP 200 返回时 webhook 可能仍在重试中
-2. webhook 发送失败**不回滚** Run 状态（success 已持久化）
-3. 第三方系统应同时支持 **轮询 GET** 和 **webhook 回调** 两种方式
+1. **三层区分**：① 业务代码调用 `sendWebhook()` 分发器 → ② `sendWebhookWithRetry()` 首次 HTTP 发送 → ③ 超时/失败后递归 setTimeout 重试
+2. **HTTP 响应与 webhook 异步**：HTTP 200 在 T≈5105 返回时，首次 webhook 可能仍在飞行，第 2、3 次重试可能延后数秒甚至数十秒
+3. **重试在后台继续**：失败重试用 `setTimeout` 异步调度，`Promise.allSettled` 只等待首次发送，不等待重试完成
+4. **webhook 失败不回滚**：Run.status='success' 已在 T≈5000 持久化，后续 webhook 全失败也不改变
+5. **第三方系统建议**：同时支持 **轮询 GET** 和 **webhook 回调**，避免依赖 webhook 的时效可靠性
 
 ---
 
