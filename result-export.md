@@ -552,3 +552,281 @@ Webhook 发送失败时采用指数退避重试：
 | [airtable.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/integrations/airtable.ts) | Airtable 集成导出 |
 | [webhook.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/routes/webhook.ts) | Webhook 导出 |
 | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/storage.ts) | 文件系统存储工具函数 |
+
+---
+
+## 十一、三种触发方式对比
+
+系统支持三种 Run 触发方式，它们在执行模型、格式转换、数据回写等方面存在显著差异。
+
+### 11.1 触发入口总览
+
+| 触发方式 | 入口文件 | 核心函数 | 执行模型 |
+|----------|----------|----------|----------|
+| **API 手动触发（SDK）** | [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts) | `POST /api/sdk/robots/:id/execute` | 同步阻塞 + 后台异步执行 |
+| **定时任务触发** | [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | `processDueSchedules` | 异步队列（Graphile Worker） |
+| **后台运行器** | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts) | `processRunExecution` | 异步队列（Graphile Worker） |
+
+---
+
+### 11.2 触发入口详解
+
+#### 11.2.1 API 手动触发（SDK）
+
+**调用链路：**
+```
+HTTP 请求 → POST /api/sdk/robots/:id/execute
+    ↓
+handleRunRecording(robotId, userId, runSource, requestedFormats, promptInstructions)
+    ↓
+createWorkflowAndStoreMetadata → 创建 Run 记录（status=scheduled）
+    ↓
+建立 Socket 连接 → 监听 ready-for-run 事件
+    ↓
+executeRun → 实际执行工作流
+    ↓
+waitForRunCompletion → 轮询数据库等待 Run 完成（最多 3 小时）
+    ↓
+数据提取与整理 → 返回标准化 JSON 响应
+```
+
+**核心特点：**
+- **支持动态参数**：可在请求体中覆盖 `formats` 和 `promptInstructions`
+  ```typescript
+  const requestedFormats = req.body?.formats as OutputFormats[] | undefined;
+  const promptInstructions = req.body?.promptInstructions;
+  ```
+  代码位置：[sdk.ts#L691-L692](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts#L691-L692)
+
+- **同步等待结果**：通过 `waitForRunCompletion` 轮询数据库，每 2 秒检查一次 Run 状态
+  代码位置：[waitForRunCompletion](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts#L806-L828)
+
+- **响应数据标准化**：返回前对数据库原始数据进行结构整理
+  ```typescript
+  return {
+    runId: run.runId,
+    status: run.status,
+    data: {
+      textData: run.serializableOutput?.scrapeSchema || {},
+      listData: listData,           // 从 scrapeList 提取
+      crawlData: crawlData,         // 从 crawl 提取
+      searchData: searchData,       // 从 search 提取
+      text: text,                   // 从 text[0].content 提取
+      markdown: markdown,           // 从 markdown[0].content 提取
+      html: html,                   // 从 html[0].content 提取
+      summary: summary,             // 从 summary[0].content 提取
+      promptResult: promptResult    // 从 promptResult[0].content 提取
+    },
+    screenshots: Object.values(run.binaryOutput || {})
+  };
+  ```
+  代码位置：[sdk.ts#L776-L793](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts#L776-L793)
+
+#### 11.2.2 定时任务触发
+
+**调度流程：**
+```
+startScheduleWorker()
+    ↓
+setInterval(processDueSchedules, 30000)  // 每 30 秒轮询一次
+    ↓
+claimDueDbSchedules()
+    ├─ pg_try_advisory_xact_lock  // 分布式锁，防止多实例重复调度
+    ├─ 查询 Robot 表中 schedule.nextRunAt <= now 的记录
+    ├─ FOR UPDATE SKIP LOCKED     // 行级锁，跳过已被锁定的行
+    └─ 更新 schedulerClaimedAt = now 标记认领
+    ↓
+addJob(QUEUE_NAMES.SCHEDULED_WORKFLOW, { robotMetaId, userId })
+    ↓
+Graphile Worker 消费 → handleRunRecording(robotMetaId, userId)
+    ↓
+finalizeSchedule()
+    ├─ 计算 nextRunAt（通过 cron 表达式）
+    ├─ 更新 lastRunAt 和 nextRunAt
+    └─ 清除 schedulerClaimedAt
+```
+
+**调度配置参数：**
+```typescript
+DB_SCHEDULER_BATCH_SIZE = 10;          // 每批最多认领 10 个任务
+DB_SCHEDULER_POLL_MS = 30000;           // 轮询间隔 30 秒
+DB_SCHEDULER_CLAIM_TIMEOUT_MS = 600000; // 认领超时 10 分钟
+```
+
+代码位置：[schedule-worker.ts#L14-L17](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts#L14-L17)
+
+**分布式锁机制：**
+```sql
+SELECT pg_try_advisory_xact_lock(43821742) AS locked
+```
+使用 PostgreSQL 咨询锁确保同一时刻只有一个调度实例在认领任务。
+
+代码位置：[claimDueDbSchedules](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts#L29-L85)
+
+#### 11.2.3 后台运行器
+
+**任务队列：**
+```
+addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId })
+    ↓
+Graphile Worker 消费 → processRunExecution(data)
+```
+
+队列定义：[task-runner.ts#L37-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L37-L45)
+
+---
+
+### 11.3 核心差异对比表
+
+| 对比维度 | API 手动触发（SDK） | 定时任务触发 | 后台运行器 |
+|----------|---------------------|-------------|-----------|
+| **执行模型** | 同步 HTTP 阻塞 + 后台异步 | 纯异步队列 | 纯异步队列 |
+| **入口函数** | `handleRunRecording(robotId, userId, runSource, requestedFormats, promptInstructions)` | `handleRunRecording(robotMetaId, userId)` | `processRunExecution({userId, runId, browserId})` |
+| **Run 创建时机** | 调用时同步创建 | 调度认领时创建 | 任务入队前创建 |
+| **动态 formats** | ✅ 支持（请求体覆盖） | ❌ 使用机器人默认配置 | ❌ 使用机器人默认配置 |
+| **动态 promptInstructions** | ✅ 支持（请求体覆盖） | ❌ 使用机器人默认配置 | ✅ 支持（通过 interpreterSettings） |
+| **返回结果** | 标准化 JSON 响应（同步） | 无直接返回（异步） | 无直接返回（异步） |
+| **source 标记** | `sdk` 或 `cli` | `scheduled` | `manual` |
+| **Abort 检查** | ❌ 无 | ✅ 有（executeRun 中检查） | ✅ 有（关键点多次检查） |
+| **格式转换时机** | 执行中同步转换 | 执行中同步转换 | 执行中同步转换 |
+| **截图上传时机** | 执行完成后立即上传 | 执行完成后立即上传 | 执行完成后立即上传 |
+| **集成导出时机** | 执行完成后立即触发 | 执行完成后立即触发 | 执行完成后立即触发 |
+| **最大等待时间** | 3 小时（API 层） | 10 分钟（工作流执行） | 10 分钟（工作流执行） |
+
+---
+
+### 11.4 各环节详细差异
+
+#### 11.4.1 格式转换（Format Conversion）
+
+| 机器人类型 | API 手动触发 | 定时任务触发 | 后台运行器 |
+|-----------|-------------|-------------|-----------|
+| **scrape 类型** | 优先使用 `requestedFormats`，无则用 `recording_meta.formats`，最后默认 `['markdown']` | 仅使用 `recording_meta.formats`，默认 `['markdown']` | 仅使用 `recording_meta.formats`，默认 `['markdown']` |
+| **crawl/search 类型** | 后处理阶段使用 `recording_meta.formats` | 后处理阶段使用 `recording_meta.formats` | 后处理阶段使用 `recording_meta.formats` |
+
+**代码差异：**
+- API 触发：
+  ```typescript
+  const rawFormats = run.interpreterSettings?.formats || recording.recording_meta.formats;
+  ```
+  代码位置：[scheduler/index.ts#L269](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L269)
+
+- 后台运行器：
+  ```typescript
+  const rawFormats = run.interpreterSettings?.formats || recording.recording_meta.formats;
+  ```
+  代码位置：[task-runner.ts#L242](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L242)
+
+#### 11.4.2 截图上传（Binary Upload）
+
+三种触发方式的截图上传逻辑 **完全一致**，都在执行完成后调用 `BinaryOutputService.uploadAndStoreBinaryOutput`：
+
+```typescript
+const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
+const uploadedBinaryOutput = Object.keys(binaryOutput).length > 0
+  ? await binaryOutputService.uploadAndStoreBinaryOutput(run, binaryOutput)
+  : {};
+```
+
+代码位置：
+- 定时任务：[scheduler/index.ts#L650-L653](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L650-L653)
+- 后台运行器：[task-runner.ts#L461-L463](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L461-L463)
+
+#### 11.4.3 集成导出（Integration Export）
+
+三种触发方式的集成导出逻辑 **完全一致**，都调用 `triggerIntegrationUpdates`：
+
+```typescript
+await triggerIntegrationUpdates(plainRun.runId, plainRun.robotMetaId);
+```
+
+该函数内部：
+1. 添加 Google Sheets 更新任务到队列
+2. 添加 Airtable 更新任务到队列
+3. 异步执行 `processAirtableUpdates()` 和 `processGoogleSheetUpdates()`
+4. 每个任务有 65 秒超时限制
+
+代码位置：
+- 定时任务：[scheduler/index.ts#L755](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L755)
+- 后台运行器：[task-runner.ts#L508](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L508)
+
+#### 11.4.4 数据库回写（Database Write-back）
+
+| 触发方式 | 数据库回写时机 | 状态流转 |
+|----------|----------------|----------|
+| **API 手动触发** | 执行中实时批量写入 + 完成时最终更新 | scheduled → running → success/failed |
+| **定时任务触发** | 执行中实时批量写入 + 完成时最终更新 | scheduled → running → success/failed |
+| **后台运行器** | 执行中实时批量写入 + 完成时最终更新<br>**关键点检查 Run 是否被 Abort** | scheduled → running → success/failed/aborted |
+
+**Abort 检查差异**：
+
+后台运行器在多个关键点检查 Run 是否被中止：
+1. 执行开始前检查 `run.status === 'aborted' || run.status === 'aborting'`
+2. 工作流解释完成后检查 `await isRunAborted()`
+3. 格式后处理后检查 `await isRunAborted()`
+
+```typescript
+const isRunAborted = async (): Promise<boolean> => {
+  const currentRun = await Run.findOne({ where: { runId: data.runId } });
+  return currentRun ? (currentRun.status === 'aborted' || currentRun.status === 'aborting') : false;
+};
+```
+
+代码位置：[task-runner.ts#L381-L386](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L381-L386)
+
+#### 11.4.5 Webhook 触发
+
+| 触发方式 | Webhook Payload 差异 |
+|----------|---------------------|
+| **API 手动触发** | 与定时任务、后台运行器一致，包含完整的 extracted_data |
+| **定时任务触发** | 包含完整的 extracted_data（captured_texts、captured_lists、crawl_data、search_data） |
+| **后台运行器** | 包含完整的 extracted_data，失败时额外包含 partial_data_extracted 标记 |
+
+---
+
+### 11.5 触发路径完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              触发入口层                                      │
+├─────────────────────────────────┬───────────────────────────┬───────────────┤
+│  API /sdk/robots/:id/execute    │  schedule-worker 轮询     │  前端手动运行  │
+│  (同步等待)                     │  (30秒轮询 + 分布式锁)    │  (入队执行)    │
+└─────────────────┬───────────────┴─────────────┬─────────────┴───────────────┘
+                  │                             │
+                  ▼                             ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          handleRunRecording 入口                             │
+│  参数：(robotId, userId, runSource?, requestedFormats?, promptInstructions?)│
+│  功能：创建 Run 记录 → 建立 Socket → 触发 executeRun                        │
+└───────────────────────────────────────────┬─────────────────────────────────┘
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          executeRun (scheduler/index.ts)                    │
+│  scrape 机器人：直接格式转换 → 截图上传 → 集成导出                           │
+│  其他机器人：InterpretRecording → 格式后处理 → 截图上传 → 集成导出            │
+│  source 标记：scheduled                                                      │
+└───────────────────────────────────────────┬─────────────────────────────────┘
+                                            │
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        processRunExecution (task-runner.ts)                 │
+│  scrape 机器人：直接格式转换 → 截图上传 → 集成导出                           │
+│  其他机器人：InterpretRecording → 格式后处理 → 截图上传 → 集成导出            │
+│  ✅ 多节点 Abort 检查                                                        │
+│  source 标记：manual                                                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 11.6 触发入口代码索引
+
+| 文件 | 触发方式 | 关键函数 |
+|------|----------|----------|
+| [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts) | API 手动触发 | `POST /api/sdk/robots/:id/execute`、`waitForRunCompletion` |
+| [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | 定时任务触发 | `claimDueDbSchedules`、`processDueSchedules`、`finalizeSchedule` |
+| [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts) | 定时任务执行 | `handleRunRecording`、`createWorkflowAndStoreMetadata`、`executeRun` |
+| [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts) | 后台运行器 | `processRunExecution`、`abortRun`、`QUEUE_NAMES` |
+
