@@ -1,358 +1,463 @@
 # 录制阶段选择器生成机制分析
 
-## 一、整体架构概览
+## 一、核心概念：为什么容易混淆？
 
-录制阶段的核心目标是将用户在浏览器中的交互事件（点击、输入等）转化为可在回放阶段稳定执行的元素定位信息。整个数据流分为 6 个关键阶段：
+录制阶段选择器的抽象之所以绕，是因为项目中存在**两套选择器生成器**和**两种录制模式**，它们在不同的时机、不同的运行环境中被调用，承担不同的职责。
 
-```
-用户浏览器交互
-      ↓
-[1] 前端事件捕获 + 坐标采集
-      ↓  socket.io (dom:click / dom:keypress 等)
-[2] 服务端事件路由分发 (inputHandlers.ts)
-      ↓
-[3] WorkflowGenerator 编排处理 (Generator.ts)
-      ↓  Playwright page.evaluate()
-[4] 浏览器端元素定位：坐标 → HTMLElement (穿透 Shadow DOM / Iframe)
-      ↓
-[5] 多策略选择器并行生成 (@medv/finder 算法)
-      ↓
-[6] 选择器优先级决策 → 嵌入 Where-What Pair workflow
-```
+| 维度 | 客户端选择器生成器 | 服务端选择器生成器 |
+|------|------------------|------------------|
+| 所在文件 | [clientSelectorGenerator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) | [selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) |
+| 运行环境 | 前端浏览器（iframe 内） | 服务端 Playwright 控制的浏览器 |
+| 核心算法 | @medv/finder（内嵌实现） | @medv/finder（内嵌实现，代码几乎相同） |
+| 实例方式 | 单例 `clientSelectorGenerator` | 函数集合，通过 `page.evaluate()` 注入执行 |
+| 主要用途 | DOM 模式下事件捕获 + 高亮显示 + 分组检测 | Screenshot 模式下选择器生成 + workflow 构建 |
+
+> **关键理解**：两套代码逻辑同源（都是 @medv/finder 算法的内嵌实现），但运行在不同的浏览器上下文中，服务于不同的录制阶段。
 
 ---
 
-## 二、事件捕获与传输链路
+## 二、两种录制模式
 
-### 2.1 前端事件源
+### 2.1 DOM 模式 vs Screenshot 模式
 
-用户的浏览器交互通过录制脚本注入页面后监听 DOM 事件，采集的信息包括：
-- **坐标信息**：`{ x, y }` 鼠标点击位置（核心定位依据）
-- **事件类型**：`click`、`keypress`、`input`、`change` 等
-- **元素辅助信息**：标签名、类名、文本内容等
+录制存在两种交互模式，它们的选择器生成链路完全不同：
 
-### 2.2 Socket.io 事件路由
+| 模式 | 触发条件 | 选择器由谁生成 | 数据流向 |
+|------|---------|--------------|---------|
+| **DOM 模式** | `dom-mode-enabled` 事件 | 前端 `clientSelectorGenerator` | 前端生成 → socket 传输 → 服务端直接使用 |
+| **Screenshot 模式** | `screenshot-mode-enabled` 事件 | 服务端 `selector.ts` | 前端传坐标 → 服务端 Playwright evaluate 重新生成 |
 
-服务端通过 [inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts) 注册事件监听：
-
-| Socket 事件         | 对应处理函数                  | 说明                   |
-|---------------------|-----------------------------|------------------------|
-| `dom:click`         | `onDOMClickAction`          | DOM 点击动作           |
-| `dom:keypress`      | `onDOMKeyboardAction`       | 键盘按键动作           |
-| `input:url`         | `onUrlChangeAction`         | URL 导航               |
-| `input:date`        | `onDOMInputAction`          | 日期输入               |
-| `input:dropdown`    | `onDOMDropdownAction`       | 下拉选择               |
-
-所有事件处理器通过 `handleWrapper()` 包装，确保仅在浏览器活跃且非解释执行状态时才处理输入。
-
----
-
-## 三、WorkflowGenerator 核心编排
-
-[Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts) 是录制阶段的大脑，负责将原始事件转化为结构化的 Where-What Pair。
-
-### 3.1 核心方法调用链
-
-以点击事件 `onDOMClickAction` 为例：
-
-```
-onDOMClickAction(page, data)
-    ↓
-generateSelector(page, coordinates, action)  ← 关键：生成选择器
-    ├─ getElementInformation(page, coordinates)  ← 获取元素基础信息
-    ├─ getSelectors(page, coordinates)           ← 生成多策略选择器
-    └─ getBestSelectorForAction(action)          ← 决策最优选择器
-    ↓
-构建 WhereWhatPair:
-  {
-    where: { url, selectors: [bestSelector] },
-    what:  [{ action: "click", args: [{ ... }] }]
-  }
-    ↓
-addPairToWorkflowAndNotifyClient(pair, page)
-    ↓
-workflow 优化（如将连续 keypress 合并为 type）
-```
-
-### 3.2 Where-What Pair 结构
-
-工作流采用条件-动作对的结构：
+`WorkflowGenerator` 通过 `isDOMMode` 标志位跟踪当前模式：
 
 ```typescript
-interface WhereWhatPair {
-  where: {
-    url: string;           // 页面 URL 匹配条件
-    selectors?: string[];  // 元素选择器条件（回放时验证元素存在）
+// Generator.ts L159
+private isDOMMode: boolean = false;
+
+// L203-L213
+private initializeDOMListeners() {
+  this.socket.on('dom-mode-enabled', () => {
+    this.isDOMMode = true;
+  });
+  this.socket.on('screenshot-mode-enabled', () => {
+    this.isDOMMode = false;
+  });
+}
+```
+
+---
+
+## 三、前端侧：录制组件与客户端选择器生成器
+
+### 3.1 前端录制组件 DOMBrowserRenderer
+
+[DOMBrowserRenderer.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx) 是前端录制的核心组件，它在 iframe 中渲染录制页面，并直接监听 DOM 事件。
+
+**核心职责**：
+1. 在 iframe 文档上绑定原生事件监听器（mousedown、keydown、wheel 等）
+2. 调用 `clientSelectorGenerator` 生成选择器
+3. 通过 Socket.io 将事件 + 选择器发送给服务端
+4. 处理元素高亮、列表分组可视化等 UI 交互
+
+**事件监听器注册**（setupIframeInteractions）：
+
+```typescript
+// L752-L760
+handlers.mousedown = mouseDownHandler;     // 点击/选择
+handlers.mouseup = mouseUpHandler;
+handlers.mousemove = mouseMoveHandler;    // 悬停高亮
+handlers.wheel = wheelHandler;            // 滚动
+handlers.keydown = keyDownHandler;        // 键盘输入
+handlers.keyup = keyUpHandler;
+handlers.click = clickHandler;
+handlers.submit = preventDefaults;
+handlers.beforeunload = preventDefaults;
+```
+
+### 3.2 客户端选择器生成器 clientSelectorGenerator
+
+[clientSelectorGenerator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) 是一个单例类，在前端 iframe 上下文中运行。
+
+**导出方式**：
+```typescript
+// L4378-L4379
+export { ClientSelectorGenerator };
+export const clientSelectorGenerator = new ClientSelectorGenerator();
+```
+
+**核心公共方法**：
+
+| 方法 | 输入 | 输出 | 调用时机 |
+|------|------|------|---------|
+| `generateSelector(iframeDoc, coords, action)` | Document + 坐标 + 动作类型 | 最优选择器字符串 | 点击/键盘事件发生时 |
+| `generateDataForHighlighter(coords, iframeDoc, ...)` | 坐标 + Document | 高亮数据（rect、selector、elementInfo、groupInfo） | 鼠标移动/悬停时 |
+| `getElementInformation(iframeDoc, coords, ...)` | Document + 坐标 | ElementInfo 对象 | 事件发生时获取元素详情 |
+| `generateSelectorsFromElement(element, iframeDoc)` | HTMLElement | 多策略 Selectors 对象 | 从元素直接生成 |
+| `getChildSelectors(iframeDoc, parentSelector)` | 父选择器 | 子元素选择器数组 | 列表模式下 |
+| `analyzeElementGroups(iframeDoc)` | Document | 无（内部状态更新） | 列表模式每次悬停时 |
+
+### 3.3 前端调用时机与数据流
+
+以点击事件为例，前端 `mouseDownHandler` 的完整流程：
+
+```
+用户在 iframe 中点击
+      ↓
+mouseDownHandler 触发
+      ├─ 计算点击坐标 (iframeX, iframeY)
+      │
+      ├─ [捕获模式判断] isInCaptureMode (getText || getList)
+      │   ├─ 是 → 调用 onElementSelect（选择元素，不发送点击）
+      │   └─ 否 → 继续录制流程
+      │
+      ├─ [链接特殊处理] 检测 target.closest("a[href]")
+      │   └─ 是 → 阻止默认跳转，记录 isSPA 标志
+      │
+      ├─ 生成选择器
+      │   └─ clientSelectorGenerator.generateSelector(
+      │          iframeDoc, {x, y}, ActionType.Click
+      │       )
+      │
+      ├─ 获取元素信息
+      │   └─ clientSelectorGenerator.getElementInformation(...)
+      │
+      ├─ [特殊输入判断]
+      │   ├─ SELECT 标签 → 触发 onShowDropdown（弹出下拉选择器）
+      │   ├─ date/time/datetime-local input → 触发日期选择器
+      │   └─ 普通元素 → 发送 dom:click 事件
+      │
+      └─ Socket 发送
+          └─ socket.emit("dom:click", {
+               selector,         // 前端已生成好的选择器
+               userId,
+               elementInfo,      // 元素详情
+               coordinates,      // 相对坐标
+               isSPA             // 是否 SPA 链接
+             })
+```
+
+---
+
+## 四、Socket 事件载荷详解
+
+### 4.1 主要事件与载荷格式
+
+| Socket 事件 | 发送方 | 载荷结构 |
+|------------|--------|---------|
+| `dom:click` | 前端 → 服务端 | `{ selector, userId, elementInfo, coordinates?, isSPA? }` |
+| `dom:keypress` | 前端 → 服务端 | `{ selector, key, userId, inputType? }` |
+| `dom:scroll` | 前端 → 服务端 | `{ deltaX, deltaY }` |
+| `input:url` | 前端 → 服务端 | `string` (url) |
+| `input:date` | 前端 → 服务端 | `{ selector, value }` |
+| `input:dropdown` | 前端 → 服务端 | `{ selector, value }` |
+| `highlighter` | 服务端 → 前端 | `{ rect, selector, elementInfo, isDOMMode, shadowInfo }` |
+| `workflow` | 服务端 → 前端 | `WorkflowFile` 完整工作流 |
+
+### 4.2 dom:click 载荷详解
+
+```typescript
+// DOMBrowserRenderer.tsx L569-L583
+socket.emit("dom:click", {
+  selector,            // 已生成的最优选择器（字符串）
+  userId: user?.id || "unknown",
+  elementInfo,         // ElementInfo 对象（标签名、属性、文本等）
+  coordinates: {       // 相对元素坐标
+    x: relativeX,
+    y: relativeY
+  },
+  isSPA: false         // 是否为 SPA 导航
+});
+```
+
+> **重要**：`dom:click` 事件中已经包含了**前端生成好的 selector**，服务端的 `onDOMClickAction` **直接使用这个 selector**，不再重新生成。
+
+### 4.3 dom:keypress 载荷详解
+
+```typescript
+// DOMBrowserRenderer.tsx L642-L647
+socket.emit("dom:keypress", {
+  selector,        // 焦点元素的选择器
+  key: keyboardEvent.key,
+  userId: user?.id || "unknown",
+  inputType: elementInfo?.attributes?.type || "text",
+});
+```
+
+---
+
+## 五、服务端：事件路由与 Workflow 构建
+
+### 5.1 事件路由：inputHandlers.ts
+
+[inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts) 是服务端的 Socket 事件注册中心。
+
+**注册入口**：
+```typescript
+// L871-L887
+const registerInputHandlers = (socket: Socket, userId: string) => {
+    socket.on("input:keyup", (data) => onKeyup(data, userId));
+    socket.on("input:url", (data) => onChangeUrl(data, userId));
+    socket.on("input:date", (data) => onDateSelection(data, userId));
+    socket.on("dom:click", (data) => onDOMClickAction(data, userId));
+    socket.on("dom:keypress", (data) => onDOMKeyboardAction(data, userId));
+    // ...
+};
+```
+
+### 5.2 包装器模式：handleWrapper
+
+所有事件处理器都通过 `handleWrapper` 包装，确保：
+1. 浏览器实例存在且活跃
+2. 不在解释执行（回放）状态
+3. 当前 Page 有效
+
+```typescript
+// L28-L57
+const handleWrapper = async (handleCallback, userId, args?) => {
+    const id = browserPool.getActiveBrowserId(userId, "recording");
+    if (id) {
+        const activeBrowser = browserPool.getRemoteBrowser(id);
+        // 回放中则忽略输入
+        if (activeBrowser?.interpreter.interpretationInProgress()) return;
+        const currentPage = activeBrowser?.getCurrentPage();
+        if (currentPage && activeBrowser) {
+            await handleCallback(activeBrowser, currentPage, args);
+        }
+    }
+};
+```
+
+### 5.3 选择器如何进入工作流：onDOMClickAction 完整流程
+
+以 `dom:click` 事件为例，服务端处理链路：
+
+```
+socket.on("dom:click", data)
+      ↓
+onDOMClickAction(data, userId)        [inputHandlers.ts]
+      ↓
+handleWrapper(handleClickAction, ...) [inputHandlers.ts]
+      ↓
+handleClickAction(activeBrowser, page, data)
+      ├─ 步骤1: 移除 target="_blank" 防止新标签
+      │    └─ page.evaluate(sel) → document.querySelector(sel)
+      │
+      ├─ 步骤2: Playwright 执行真实点击
+      │    ├─ input 元素且有坐标 → page.mouse.click(坐标)
+      │    └─ 普通元素 → page.click(selector)
+      │
+      └─ 步骤3: 生成 Workflow Pair
+           └─ generator.onDOMClickAction(page, data)
+                └─ addPairToWorkflowAndNotifyClient(pair, page)
+                     └─ socket.emit("workflow", workflowRecord)
+```
+
+### 5.4 WorkflowGenerator 中的构建逻辑
+
+[Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts) 的 `onDOMClickAction` 直接使用前端传来的 selector：
+
+```typescript
+// L426-L458
+public onDOMClickAction = async (page, data) => {
+  const { selector, url, elementInfo, coordinates } = data;
+
+  // 直接使用前端传来的 selector 构建 Pair
+  const pair: WhereWhatPair = {
+    where: { 
+      url: this.getBestUrl(url),
+      selectors: [selector]    // selector 进入 where 条件
+    },
+    what: [{
+      action: 'click',
+      args: [selector],       // selector 进入 what 动作参数
+    }],
   };
-  what: Array<{
-    action: string;       // "click" | "type" | "scroll" 等
-    args: any[];          // 动作参数
-  }>;
-}
-```
 
----
-
-## 四、元素定位：从坐标到 DOM 元素
-
-选择器生成的第一步是将屏幕坐标 `(x, y)` 映射到准确的 HTMLElement。这一逻辑在 [selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) 的 `getElementInformation()` 和 `getSelectors()` 中通过 `page.evaluate()` 在浏览器端执行。
-
-### 4.1 标准元素定位流程
-
-```
-document.elementsFromPoint(x, y)
-      ↓  获取该坐标下所有堆叠元素
-findDeepestElement()
-      ↓  选择 DOM 树中最深层（最具体）的元素
-[A 标签特殊处理] 若父元素是 <a>，则升级到 <a> 标签
-      ↓
-traverseShadowDOM()  ← 穿透 Shadow DOM
-      ↓
-处理 iframe / frame 穿透
-      ↓
-返回目标 HTMLElement
-```
-
-### 4.2 Shadow DOM 穿透
-
-使用 `elementFromPoint` + `shadowRoot` 递归遍历（最大深度 4 层）：
-
-```typescript
-function traverseShadowDOM(element: HTMLElement): HTMLElement {
-  let current = element;
-  let shadowRoot = current.shadowRoot;
-  while (shadowRoot && depth < MAX_SHADOW_DEPTH) {
-    const shadowElement = shadowRoot.elementFromPoint(x, y);
-    if (!shadowElement || shadowElement === current) break;
-    deepest = shadowElement;
-    current = shadowElement;
-    shadowRoot = current.shadowRoot;
+  // input/textarea 附加坐标信息
+  if (elementInfo && coordinates && isInputElement) {
+    pair.what[0].args.push(
+      { position: coordinates },
+      { cursorIndex: 0 }
+    );
   }
-  return deepest;
-}
+
+  // 记录状态
+  this.generatedData.lastUsedSelector = selector;
+  this.generatedData.lastAction = 'click';
+
+  // 加入工作流并通知前端
+  await this.addPairToWorkflowAndNotifyClient(pair, page);
+};
 ```
 
-### 4.3 Iframe / Frame 穿透
+> **关键点**：`onDOMClickAction` **不重新生成选择器**，它直接消费前端通过 socket 发送的 `selector`。选择器在前端 `mouseDownHandler` 中已经生成完毕。
 
-对于 iframe 和传统 frame，通过坐标偏移计算相对位置后递归进入：
+### 5.5 addPairToWorkflowAndNotifyClient：合并与通知
 
-```
-检测到元素是 <iframe> 或 <frame> 或在 frameset 中
-      ↓
-计算点击在 iframe 内的相对坐标: (iframeX = x - iframeRect.left)
-      ↓
-iframeDocument.elementFromPoint(iframeX, iframeY)
-      ↓
-递归 traverseShadowDOM()
-      ↓
-若内部还有 iframe，继续嵌套（最大 4 层）
-```
-
----
-
-## 五、@medv/finder 算法：自底向上 CSS 选择器生成
-
-项目采用 `@medv/finder` 算法的本地实现（内嵌在 `getSelectors()` 中），核心思想是**自底向上搜索 + 惩罚分数排序 + 唯一性验证**。
-
-### 5.1 惩罚分数体系 (Penalty)
-
-| 选择器类型   | 惩罚分 | 说明                     |
-|-------------|--------|--------------------------|
-| `#id`       | 0      | 最优，ID 选择器          |
-| `[attr=val]`| 0.5    | 属性选择器               |
-| `.class`    | 1      | 类名选择器               |
-| `tag`       | 2      | 标签选择器               |
-| `*`         | 3      | 通配符（兜底）           |
-| `:nth-child(i)` | +1 | 位置伪类（附加惩罚）     |
-
-目标：找到**能够唯一确定该元素**的**惩罚分数总和最小**的选择器组合。
-
-### 5.2 自底向上搜索 (bottomUpSearch)
-
-从目标元素开始，逐层向父元素遍历，为每一层生成候选 Node 列表：
-
-```
-目标元素 <button class="btn primary" id="submit">
-  level[0] 候选: [#submit, .btn, .primary, button, *]
-      ↓
-父元素 <form class="login-form">
-  level[1] 候选: [.login-form, form, *]
-      ↓
-祖先元素 <div class="container">
-  level[2] 候选: [.container, div, *]
-```
-
-每一层候选按优先级排序：`id > 属性 > 类名 > 标签 > *`
-
-### 5.3 三级 Limit 降级策略
-
-搜索按 Limit 分为三级，逐级降级以平衡性能和结果质量：
-
-| Limit    | 策略                                         |
-|----------|----------------------------------------------|
-| `All`    | 每层保留所有候选 + nth-child 变体             |
-| `Two`    | 每层仅保留最优 1 个候选 + nth-child 变体      |
-| `One`    | 每层仅保留最优 1 个候选，必要时加 nth-child   |
-
-调用链：`bottomUpSearch(All) → 失败则 fallback → bottomUpSearch(Two) → 失败则 fallback → bottomUpSearch(One)`
-
-### 5.4 组合生成与唯一性验证
-
-将各层候选进行笛卡尔积组合，按惩罚分升序排列后逐一验证：
-
-```
-对于候选路径 path:
-  1. selector(path) → 组装为 CSS 选择器字符串
-  2. rootDocument.querySelectorAll(css).length
-     - == 1: 唯一匹配 ✓ 成功返回
-     - == 0: 异常（选择不到元素）
-     - > 1: 不唯一，尝试下一个
-```
-
-相邻层级用 `>`（直接子元素），其余用空格（后代元素）连接。
-
-### 5.5 优化阶段 (optimize)
-
-找到唯一选择器后，尝试递归删除中间层节点以获得更短的选择器：
-
-```
-原始: div.container > form.login-form > button#submit
-            ↓ 尝试删除 .login-form
-验证: div.container > button#submit 是否唯一？
-            ↓ 是
-优化后: div.container > button#submit
-```
-
----
-
-## 六、多策略选择器并行生成
-
-单次录制不会只生成一个选择器，而是并行生成 **10+ 种不同策略**的选择器，组成 `Selectors` 对象，由 [selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) `genSelectors()` 函数负责：
+选择器进入工作流后，`addPairToWorkflowAndNotifyClient` 做智能合并：
 
 ```typescript
-interface Selectors {
-  id?: string | null;                    // #id 选择器
-  generalSelector?: string | null;       // 通用 finder 结果（默认配置）
-  attrSelector?: string | null;          // 允许任意属性的 finder 结果
-  testIdSelector?: string | null;        // 测试 ID 属性（data-testid 等）
-  text?: string;                         // 元素文本内容
-  href?: string;                         // href 属性值
-  hrefSelector?: string | null;          // 基于 href 的选择器
-  accessibilitySelector?: string | null; // aria-label / alt / title
-  formSelector?: string | null;          // name / placeholder / for
-  relSelector?: string | null;           // rel 属性
-  iframeSelector?: {                     // iframe 穿透选择器
-    full: string;
-    isIframe: boolean;
-  } | null;
-  shadowSelector?: {                     // Shadow DOM 穿透选择器
-    full: string;
-    mode: string;  // "open" | "closed"
-  } | null;
-}
-```
+// L295-L344
+private addPairToWorkflowAndNotifyClient = async (pair, page) => {
+  // 1. 检查是否已存在相同 where 选择器的 Pair
+  //    → 存在：将 what 追加到已有 Pair（同页面多步操作合并）
+  //    → 不存在：继续
+  let matched = selectorAlreadyInWorkflow(
+    pair.where.selectors[0],
+    this.workflowRecord.workflow
+  );
+  if (matched) {
+    matched.what = matched.what.concat(pair.what);
+    return;
+  }
 
-### 6.1 特殊选择器生成逻辑
+  // 2. 处理 over-shadowing（元素同时可见导致的规则覆盖）
+  const handled = await this.handleOverShadowing(pair, page, ...);
+  if (!handled) {
+    // 3. 追加 waitForLoadState 动作
+    pair.what.push({ action: 'waitForLoadState', args: ['networkidle'] });
+    // 4. 插入工作流数组
+    this.workflowRecord.workflow.splice(index, 0, pair);
+  }
 
-**Shadow DOM 选择器**（`>>` 分隔符）：
+  // 5. 通知前端更新
+  this.socket.emit('workflow', this.workflowRecord);
+};
 ```
-hostSelector >> shadowInnerSelector
-例: .my-component >> .btn-primary
-```
-通过递归获取 shadow root 路径，每一层单独调用 finder，然后用 `>>` 连接。
-
-**Iframe 选择器**（`:>>` 分隔符）：
-```
-iframeSelector :>> innerElementSelector
-例: iframe[name="main"] :>> .submit-btn
-```
-类似 Shadow DOM，每级 iframe 单独生成选择器，用 `:>>` 连接。
 
 ---
 
-## 七、选择器优先级决策
+## 六、Screenshot 模式：服务端主导的选择器生成
 
-[utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/utils.ts) 中 `getBestSelectorForAction()` 根据**动作类型**和**标签类型**决定最终使用哪个选择器。
+### 6.1 触发时机
 
-### 7.1 决策优先级总表
+当处于 Screenshot 模式（非 DOM 模式）时，前端只发送点击坐标，服务端通过 `onClick(coordinates, page)` 方法生成选择器。
 
-#### Click / Hover / DragAndDrop 动作
+### 6.2 服务端选择器生成链路
 
-| 标签类型   | 优先级顺序（从高到低）                                                          |
-|-----------|------------------------------------------------------------------------------|
-| `<input>`  | testId → id → formSelector → accessibilitySelector → generalSelector → attrSelector |
-| `<a>`      | testId → id → hrefSelector → accessibilitySelector → generalSelector → attrSelector |
-| `<span>/<em>/<cite>/<b>/<strong>` | testId → id → accessibilitySelector → hrefSelector → textSelector → generalSelector → attrSelector |
-| 其他       | testId → id → accessibilitySelector → hrefSelector → generalSelector → attrSelector |
+```
+onClick(coordinates, page)           [Generator.ts L511]
+      ↓
+generateSelector(page, coords, action)
+      ├─ getElementInformation(page, coords)  ← 获取元素信息
+      │   └─ page.evaluate(...)  ← 在 Playwright 浏览器中执行
+      │
+      ├─ getSelectors(page, coords)           ← 生成多策略选择器
+      │   └─ page.evaluate(...)  ← 在 Playwright 浏览器中执行
+      │        └─ finder 算法（同客户端实现）
+      │
+      └─ getBestSelectorForAction(action)     ← 决策最优选择器
+           ↓
+      构建 WhereWhatPair
+           ↓
+      addPairToWorkflowAndNotifyClient
+```
 
-全局最高优先级（所有标签共享）：
-1. `iframeSelector.full`（若在 iframe 中）
-2. `shadowSelector.full`（若在 Shadow DOM 中）
+### 6.3 服务端 selector.ts 的角色
 
-#### Input / Keydown 动作
+[selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) 是服务端的选择器工具集合，所有函数都通过 `page.evaluate()` 将代码注入 Playwright 控制的浏览器中执行。
 
-优先级：`testId → id → formSelector → accessibilitySelector → generalSelector → attrSelector`
+**导出函数**：
 
-（shadowSelector 同样享有最高优先级）
-
-### 7.2 设计原则
-
-- **稳定性优先**：`data-testid` > `id` > 可访问性属性 > 类名/标签
-- **语义匹配**：链接用 `href`，表单用 `name/placeholder`，文本元素考虑 `textSelector`
-- **特殊优先**：iframe/Shadow DOM 选择器一旦存在即最高优先级，因为普通 CSS 选择器无法穿透
+| 函数 | 说明 |
+|------|------|
+| `getElementInformation(page, coords, listSelector, getList)` | 获取元素基础信息 |
+| `getSelectors(page, coords)` | 生成多策略选择器（10+ 种） |
+| `getRect(page, coords, listSelector, getList)` | 获取元素位置大小 |
+| `getNonUniqueSelectors(page, coords, listSelector)` | 列表模式非唯一选择器 |
+| `getChildSelectors(page, parentSelector)` | 获取子元素选择器 |
+| `selectorAlreadyInWorkflow(selector, workflow)` | 检查选择器是否已在工作流中 |
+| `isRuleOvershadowing(pair, workflow, page)` | 检查规则覆盖 |
 
 ---
 
-## 八、列表模式与元素分组
+## 七、完整链路对比图
 
-当处于列表抓取模式（`getList = true`）时，选择器生成逻辑发生变化：
+### 7.1 DOM 模式链路（前端主导）
 
-### 8.1 非唯一选择器 (getNonUniqueSelectors)
-
-列表模式下不再追求唯一选择器，而是生成能匹配**所有同类元素**的通用选择器。此时：
-- `findContainerElement()` 替代 `findDeepestElement()`，向上找容器节点
-- 表格的 `<td>/<th>` 自动升级到 `<table>`
-- 通过结构指纹（ElementFingerprint）进行相似度分组
-
-### 8.2 元素指纹 (ElementFingerprint)
-
-[clientSelectorGenerator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) 中定义：
-
-```typescript
-interface ElementFingerprint {
-  tagName: string;                    // 标签名
-  normalizedClasses: string;          // 归一化类名（去除动态ID类）
-  childrenCount: number;              // 子元素数量
-  childrenStructure: string;          // 子元素结构
-  attributes: string;                 // 属性签名
-  depth: number;                      // DOM 深度
-  textCharacteristics: {              // 文本特征
-    hasText: boolean;
-    textLength: number;
-    hasLinks: number;
-    hasImages: number;
-    hasButtons: number;
-  };
-  signature: string;                  // 综合签名
-}
+```
+前端浏览器 (iframe 内)
+┌─────────────────────────────────────────┐
+│ DOMBrowserRenderer 组件                 │
+│  ├─ mousedown 事件监听                  │
+│  ├─ clientSelectorGenerator.generateSelector()
+│  │   └─ @medv/finder 算法               │
+│  ├─ clientSelectorGenerator.getElementInformation()
+│  └─ socket.emit("dom:click", {
+│        selector,    ← 已生成的选择器
+│        elementInfo,
+│        coordinates
+│     })
+└───────────────────┬─────────────────────┘
+                    │ Socket.io
+                    ▼
+服务端 (Node.js)
+┌─────────────────────────────────────────┐
+│ inputHandlers.ts                        │
+│  └─ onDOMClickAction → handleClickAction│
+│        ├─ Playwright 执行点击           │
+│        │   └─ page.click(selector)      │
+│        └─ WorkflowGenerator             │
+│             └─ onDOMClickAction         │
+│                  └─ 直接使用 selector    │
+│                     构建 WhereWhatPair  │
+│                     加入 workflow        │
+└─────────────────────────────────────────┘
 ```
 
-### 8.3 分组算法
+### 7.2 Screenshot 模式链路（服务端主导）
 
-1. **表格特殊处理**：`tbody > tr` 直接强制分组（相同父 table）
-2. **结构相似度计算**：指纹相似度 ≥ 0.7 阈值归为一组
-3. **祖先桶聚类**：向上找 1~5 层祖先，将同祖先下的相似元素聚为一组（确保空间邻近）
-4. **最小分组大小**：≥ 2 个元素才认为是有效列表组
+```
+前端 (只有截图)
+┌─────────────────────────────────────────┐
+│ 用户点击截图                            │
+│  └─ socket.emit("click", coordinates)   │
+└───────────────────┬─────────────────────┘
+                    │ Socket.io
+                    ▼
+服务端 (Node.js + Playwright)
+┌─────────────────────────────────────────┐
+│ WorkflowGenerator.onClick(coords, page) │
+│  ├─ page.mouse.click(coords)            │
+│  │  ↓                                   │
+│  ├─ generateSelector(page, coords)      │
+│  │   ├─ getElementInformation()         │
+│  │   │   └─ page.evaluate(...)          │
+│  │   ├─ getSelectors()                  │
+│  │   │   └─ page.evaluate(...)          │
+│  │   │      └─ @medv/finder 算法        │
+│  │   └─ getBestSelectorForAction()      │
+│  │                                      │
+│  └─ 构建 WhereWhatPair → 加入 workflow  │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## 八、前后端职责总览
+
+| 职责 | 前端 | 服务端 |
+|------|------|--------|
+| DOM 事件捕获 | ✓（iframe 内原生监听） | ✗ |
+| 选择器生成（DOM 模式） | ✓（clientSelectorGenerator） | ✗（直接使用前端结果） |
+| 选择器生成（Screenshot 模式） | ✗ | ✓（selector.ts + Playwright） |
+| 元素高亮显示 | ✓ | ✓（highlighter 事件下发数据） |
+| 列表分组检测 | ✓（analyzeElementGroups） | ✓（服务端也有相关逻辑） |
+| Socket 事件发送 | ✓ | ✓（双向通信） |
+| Workflow 构建与管理 | ✗ | ✓（WorkflowGenerator） |
+| Playwright 浏览器操作 | ✗ | ✓ |
+| 工作流优化（合并按键等） | ✗ | ✓ |
+| 持久化存储 | ✗ | ✓ |
 
 ---
 
 ## 九、关键文件索引
 
-| 文件 | 核心职责 |
-|------|---------|
-| [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts) | 工作流编排器：事件 → Where-What Pair |
-| [server/src/workflow-management/selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) | 服务端选择器生成：@medv/finder + 多策略并行 |
-| [server/src/workflow-management/utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/utils.ts) | 选择器优先级决策 |
-| [server/src/browser-management/inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts) | Socket.io 事件路由 |
-| [src/helpers/clientSelectorGenerator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) | 客户端选择器生成 + 元素分组算法 |
-| [maxun-core/src/browserSide/scraper.js](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/maxun-core/src/browserSide/scraper.js) | 浏览器端抓取：`>>` / `:>>` 解析执行 |
+| 文件 | 端 | 核心职责 |
+|------|----|---------|
+| [src/components/recorder/DOMBrowserRenderer.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/components/recorder/DOMBrowserRenderer.tsx) | 前端 | 录制组件：iframe 事件监听 + Socket 发送 |
+| [src/helpers/clientSelectorGenerator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/src/helpers/clientSelectorGenerator.ts) | 前端 | 客户端选择器生成器：单例类 + 分组算法 |
+| [server/src/browser-management/inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/browser-management/inputHandlers.ts) | 服务端 | Socket 事件路由 + Playwright 动作执行 |
+| [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/classes/Generator.ts) | 服务端 | 工作流编排器：事件 → Where-What Pair |
+| [server/src/workflow-management/selector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/selector.ts) | 服务端 | 服务端选择器生成（page.evaluate 注入） |
+| [server/src/workflow-management/utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/server/src/workflow-management/utils.ts) | 服务端 | 选择器优先级决策 |
+| [maxun-core/src/browserSide/scraper.js](file:///d:/fz/0601-2/solo-dogfeeding/code/106-maxun/maxun-core/src/browserSide/scraper.js) | 浏览器端 | 回放时选择器执行：`>>` / `:>>` 解析 |
