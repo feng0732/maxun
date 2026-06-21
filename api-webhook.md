@@ -401,7 +401,7 @@ const response = await axios.post(webhook.url, testPayload, {
 其中：
 - **匹配数量**：`robot.webhooks` 中满足 `w.active === true && w.events.includes(eventType)` 的数量
 - **重试次数**：0 ~ `webhook.retryAttempts - 1`（默认最多重试 2 次，合计发 3 次）
-- **退避策略**：5s → 10s → 20s（指数退避）
+- **退避策略（默认）**：仅 5s → 10s，**20s 默认不会出现**（需 `retryAttempts ≥ 4` 才会走到 `5 × 2^(3-1) = 20s` 分支）
 
 ---
 
@@ -512,38 +512,117 @@ sendWebhook(robotMetaId, eventType, data)
 
 **文件**：[webhook.ts#L437-L465](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L437-L465)
 
-这是真正执行 `axios.post()` 的函数，带重试逻辑：
+这是真正执行 `axios.post()` 的函数，带指数退避重试逻辑。以下参数取自 webhook 配置，未设置时使用代码默认值。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `timeout` | 30s | axios 超时（毫秒） |
-| `retryAttempts` | 3 次 | 最多发送次数（含首次） |
-| `retryDelay` | 5s | 基础退避时间 |
-| 退避公式 | `retryDelay × 2^(attempt-1)` | 指数退避：5s → 10s → 20s |
+#### 6.2.1 默认参数
 
-**执行流程**：
+| 参数 | WebhookConfig 字段 | 默认值 | 代码来源 |
+|------|-------------------|--------|----------|
+| 请求超时 | `webhook.timeout` | **30 秒** | `webhook.timeout \|\| 30` |
+| 最多发送次数 | `webhook.retryAttempts` | **3 次**（含首次） | `webhook.retryAttempts \|\| 3` |
+| 基础退避时间 | `webhook.retryDelay` | **5 秒** | `webhook.retryDelay \|\| 5` |
+| 退避公式 | — | `retryDelay × 2^(attempt-1)` | `retryDelay * Math.pow(2, attempt - 1) |
+| 成功判定 | — | `status >= 200 && status < 300` | axios `validateStatus` 回调 |
+
+> **注意**：validateStatus 严格判定 — 3xx 重定向、4xx 客户端错误、5xx 服务端错误**全部视为失败**，触发重试。
+
+#### 6.2.2 默认发送次数与等待时序（关键！）
+
+核心判断条件在 [webhook.ts#L454](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L454)：
+
+```typescript
+if (attempt < maxRetries)  //  attempt 从 1 开始
+```
+
+**默认配置（retryAttempts=3, retryDelay=5）** 下的完整时序：
+
+| 阶段 | attempt 值 | 是否 attempt < 3? | 退避等待 | 发生了什么 |
+|------|------------|-------------------|------------|-------------|
+| ① 首次发送 | 1 | — | — | axios.post 立即发送 |
+| ① 失败后 | 1 | ✅ YES (1<3) | **5 秒** | setTimeout(send(2)) |
+| ② 第 1 次重试 | 2 | — | — | 5 秒后 attempt+1=2 发送 |
+| ② 失败后 | 2 | ✅ YES (2<3) | **10 秒** | setTimeout(send(3)) |
+| ③ 第 2 次重试 | 3 | — | — | 10 秒后 attempt+1=3 发送 |
+| ③ 失败后 | 3 | ❌ NO  (3<3=false) | **不再等待** | 放弃，打印最终失败日志 |
+
+**结论**：
+- 默认总发送次数 = **3 次**（1 次首次 + 2 次重试）
+- 默认等待序列 = **5s → 10s**
+- **20 秒等待默认不会出现** — 因为第 3 次失败后 attempt=3，不再进入重试分支，退避公式 `5 × 2^(3-1) = 20 秒`**永远不会被执行到**
+
+> **什么时候会出现 20 秒等待？** 只有用户主动将 `retryAttempts` 配置为 **≥ 4** 时，attempt=3 才会继续重试，此时等待 = `5 × 2^(3-1) = 20 秒。
+
+#### 6.2.3 完整重试时序（全部失败的最坏情况，默认配置）
+
+假设每次请求都恰好等到 30s 超时才返回失败：
+
+```
+相对时间 (秒)    事件
+────────────────  ────────────────────────────────────────────────────
+T=0s            ① attempt=1: axios.post() 发出
+T≈30s            ① 30s 超时，进入 catch
+                   → 判断 1 < 3 ✅ → setTimeout(send(2), 5s
+T≈35s            ② attempt=2: axios.post() 发出  (延迟 5s 后)
+T≈65s            ② 30s 超时，进入 catch
+                   → 判断 2 < 3 ✅ → setTimeout(send(3)), 10s
+T≈75s            ③ attempt=3: axios.post() 发出  (延迟 10s 后)
+T≈105s           ③ 30s 超时，进入 catch
+                   → 判断 3 < 3 ❌ → 放弃，打印 "failed after 3 attempts"
+```
+
+**总耗时**：30 + 5 + 30 + 10 + 30 = **约 105 秒**（3 次请求 + 2 次等待）
+
+#### 6.2.4 执行流程代码对照
+
 ```
 sendWebhookWithRetry(robotId, webhook, payload, attempt=1)
   │
-  ├─ 1. updateWebhookLastCalled()  ← 每次尝试都更新 lastCalledAt（即使失败）
+  ├─ 1. updateWebhookLastCalled()
+  │     ← 每次尝试前都会更新 lastCalledAt（即使后续会失败）
   │
-  ├─ 2. axios.post(webhook.url, payload, { timeout, ... })
+  ├─ 2. axios.post(webhook.url, payload, {
+  │       timeout: 30_000,
+  │       validateStatus: s => 200 ≤ s < 300
+  │    })
   │
-  ├─ 3. 成功 → return
+  ├─ 3. 成功 → return（resolved Promise）
   │
-  └─ 4. 失败:
-       ├─ attempt < retryAttempts → setTimeout(sendWebhookWithRetry(...), delay × 1000)
-       │    （递归 setTimeout，不阻塞 sendWebhook 的 Promise.allSettled）
-       └─ 已达最大重试 → console.error() 放弃
+  └─ 4. 失败（网络错误/超时/非 2xx）:
+       │
+       ├─ attempt < retryAttempts (默认: attempt < 3)
+       │    │
+       │    ├─ YES: 计算 delay = retryDelay × 2^(attempt-1)
+       │    │        （默认: 5s / 10s / 20s...）
+       │    │
+       │    │    setTimeout(async () => {
+       │    │        await sendWebhookWithRetry(..., attempt + 1)
+       │    │    }, delay × 1000)
+       │    │
+       │    │    ↑ 注意：setTimeout 返回 undefined，**不阻塞当前 Promise！
+       │    │       当前 Promise 在打印日志后 **立即 resolve**
+       │    │
+       │    └─ NO:  打印 "failed after N attempts" → Promise resolve
+       │
+       └─ 整个函数 **从不 reject**，所有路径最终都是 resolved
 ```
 
-> **注意**：重试使用 `setTimeout` 异步调度，因此 `sendWebhook()` 返回的 Promise 只等待**首次发送**完成，后续重试在后台继续。HTTP 响应返回给 API 客户端时，重试可能还在进行。
+#### 6.2.5 异步时序的重要特性
+
+1. **重试完全在后台**：`setTimeout` 调度递归调用但不返回 Promise，因此 `sendWebhookWithRetry()` 在首次发送失败后，立即 resolve Promise，后续重试在后台默默地进行
+
+2. **sendWebhook() 不等重试完成**：`Promise.allSettled([...])` 只等待**首次发送**完成 — 即所有 webhook 的 attempt=1 发送完成后就 resolve。此时后续 attempt=2,3 可能仍在后台排队或尚未开始
+
+3. **与 HTTP 响应的关系**：API 客户端收到 HTTP 200 时，首次 webhook 可能仍在飞行中，第 2、3 次重试可能在响应返回后的几秒甚至几十秒后才发生
+
+4. **不抛异常设计**：所有失败都在 catch 内消化，sendWebhook() 永远不会 reject，调用方无法感知 webhook 是否成功（只能查日志或查 `lastCalledAt`）
 
 ---
 
 ## 7. REST API 请求-Webhook 回调时间轴
 
-以 `POST /api/robots/:id/runs`（scrape 类型机器人，Robot 配置了 2 个 active 的 `run_completed` webhook）为例，精确时序区分三层调用：
+### 7.1 典型场景（A 失败重试两次后成功，B 首次成功）
+
+以 `POST /api/robots/:id/runs`（scrape 类型机器人，Robot 配置了 2 个 active 的 `run_completed` webhook）为例：
 
 ```
 时间轴 (ms)      事件                                   Run.status         层级
@@ -564,29 +643,59 @@ T≈5000          Markdown/HTML/截图等转换完成
                  └─ sendWebhook('run_completed')  ──── ① 分发器调用 (api/record.ts#L1017)
 T≈5050           ├─ Robot.findOne() → 找到 2 个匹配 webhook
 T≈5060           ├─ Promise.allSettled() 并发派发        │
-T≈5061           ├─ sendWebhookWithRetry(webhook A)  ── ② 首次实际发送
-T≈5061           └─ sendWebhookWithRetry(webhook B)  ── ② 首次实际发送
-T≈5070                ├─ axios.post(webhookA.url)         ├──► 第三方 A
-T≈5070                └─ axios.post(webhookB.url)         ├──► 第三方 B
+T≈5061           ├─ sendWebhookWithRetry(A, attempt=1) ─ ② 首次实际发送
+T≈5061           └─ sendWebhookWithRetry(B, attempt=1) ─ ② 首次实际发送
+T≈5070                ├─ axios.post(A)                   ├──► 第三方 A
+T≈5070                └─ axios.post(B)                   ├──► 第三方 B
 T≈5100          waitForRunCompletion() 轮询 DB
                  → 检测到 status='success'                  (webhook 仍在飞行中)
-T≈5105          返回 HTTP 200                              (sendWebhook() 此时尚未 resolve)
+T≈5105          返回 HTTP 200                                (sendWebhook() 还在等待 attempt=1 返回)
                                                               │
-T≈5180          第三方 B 返回 200 OK ◄───────────────────────┘
-T≈5200          第三方 A 超时 / 500 / ECONNREFUSED ◄───────┘
-T≈5201           └─ setTimeout(sendWebhookWithRetry(A), 5s)   ③ 第1次重试排期
-T≈10201         sendWebhookWithRetry(A, attempt=2)        ── ③ 第1次重试实际发送
-T≈10201           └─ axios.post(webhookA.url)              ├──► 第三方 A
-T≈10250          第三方 A 返回 200 OK ◄──────────────────────┘
+T≈5180          第三方 B 返回 200 OK ◄───────────────────────┘ (B 成功，resolve)
+T≈35070         第三方 A 30s 超时失败 ◄─────────────────────┘ (A 失败，setTimeout 5s，Promise resolve)
+T≈35071         sendWebhook() 的 Promise.allSettled 全部完成 ← (注意：重试仍在后台进行！)
+T≈40071         setTimeout 触发 → sendWebhookWithRetry(A, attempt=2)  ③ 第 1 次重试 (等了 5s)
+T≈40071           └─ axios.post(A)                           ├──► 第三方 A
+T≈70071         第三方 A 再次 30s 超时失败
+                 → setTimeout 10s，不返回 Promise（后台）
+T≈80071         setTimeout 触发 → sendWebhookWithRetry(A, attempt=3)  ③ 第 2 次重试 (等了 10s)
+T≈80071           └─ axios.post(A)                           ├──► 第三方 A
+T≈80150         第三方 A 返回 200 OK ◄──────────────────────── (最终成功，共发 3 次)
+
                  (所有 webhook 最终完成)
+```
+
+### 7.2 最坏情况场景（全部失败的完整时序，默认配置）
+
+假设单次请求均 30s 超时，单个 webhook 最终彻底失败：
+
+```
+相对时间 (秒)    事件
+────────────────  ─────────────────────────────────────────────────────────
+T=0              sendWebhook() 分发器被调用
+T≈0.01           sendWebhookWithRetry(attempt=1) 发起 axios
+T≈30             首次发送 30s 超时
+                   → attempt(1 < 3) ✅ → setTimeout(5s)
+                   → Promise 立即 resolve（不等待重试！）
+T≈30~35          sendWebhook() 通过 Promise.allSettled 返回给调用方
+T≈35             第 1 次重试 (attempt=2) 发出
+T≈65             第 1 次重试超时
+                   → attempt(2 < 3) ✅ → setTimeout(10s)
+T≈75             第 2 次重试 (attempt=3) 发出
+T≈105            第 2 次重试超时
+                   → attempt(3 < 3) ❌ → 放弃，打印 "failed after 3 attempts"
+
+累计：3 次请求（1 次首次 + 2 次重试），5s + 10s 两次等待，共约 105 秒
+      **20s 等待没有出现**（见 6.2.2 节）
 ```
 
 **关键点**：
 1. **三层区分**：① 业务代码调用 `sendWebhook()` 分发器 → ② `sendWebhookWithRetry()` 首次 HTTP 发送 → ③ 超时/失败后递归 setTimeout 重试
-2. **HTTP 响应与 webhook 异步**：HTTP 200 在 T≈5105 返回时，首次 webhook 可能仍在飞行，第 2、3 次重试可能延后数秒甚至数十秒
-3. **重试在后台继续**：失败重试用 `setTimeout` 异步调度，`Promise.allSettled` 只等待首次发送，不等待重试完成
-4. **webhook 失败不回滚**：Run.status='success' 已在 T≈5000 持久化，后续 webhook 全失败也不改变
-5. **第三方系统建议**：同时支持 **轮询 GET** 和 **webhook 回调**，避免依赖 webhook 的时效可靠性
+2. **HTTP 响应与 webhook 异步**：HTTP 200 在 T≈5105 返回时，首次 webhook 可能仍在飞行，第 2、3 次重试可能延后几十秒甚至百余秒
+3. **重试在后台继续**：失败重试用 `setTimeout` 异步调度，`Promise.allSettled` 只等待首次发送完成，**不等待重试 Promise**
+4. **默认时序**：等待序列是 5s → 10s，**20s 等待默认不会出现**（需要 retryAttempts ≥ 4 才会走到 20s 分支）
+5. **webhook 失败不回滚**：Run.status='success' 已在 T≈5000 持久化，后续 webhook 全失败也不改变
+6. **第三方系统建议**：同时支持 **轮询 GET** 和 **webhook 回调**，避免依赖 webhook 的时效可靠性
 
 ---
 
