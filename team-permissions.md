@@ -2,15 +2,20 @@
 
 ## 1. 总体架构概览
 
-Maxun 的权限模型是一个 **单用户隔离模型**（Single-User Isolation Model），当前版本不存在团队/组织的概念。所有资源（Robot、Run、API Key、Proxy 配置等）都以 `userId` 作为唯一归属标识，通过 **JWT Cookie 认证** 或 **API Key 认证** 两条路径进入系统，在数据查询层强制执行 `userId` 过滤，实现用户间数据隔离。
+Maxun 的权限模型是一个 **单用户隔离模型**（Single-User Isolation Model），当前版本不存在团队/组织的概念。所有资源（Robot、Run、API Key、Proxy 配置等）都以 `userId` 作为唯一归属标识，但权限执行的强度在 **高度依赖请求路径而异**：
 
-权限执行的三个层次：
+- **同步 HTTP 路径**（Web UI / API / SDK）** 经过完整的三层权限链：**JWT Cookie 认证** 或 **API Key 认证** → 路由 handler 中间件注入身份 → 数据查询层强制执行 `userId` 过滤 → 用户间数据隔离严格。
+- **异步路径**（队列轮询 / graphile-worker / 调度 worker / 集成后处理 / Socket.IO）** 完全绕过中间件**，userId 作为 payload 或 closure 中透传，下游查询大多 **不做 userId 联合校验**，隔离强度弱。
 
-| 层次 | 机制 | 代码位置 |
-|------|------|----------|
-| 身份认证 | `requireSignIn` / `requireAPIKey` 中间件 | [auth.ts](server/src/middlewares/auth.ts), [api.ts](server/src/middlewares/api.ts) |
-| 访问判断 | 每个路由内部 `userId` 条件检查 | 各 `routes/*.ts` 文件 |
-| 数据范围限制 | Sequelize 查询中 `where: { userId }` 过滤 | 各路由的数据库查询语句 |
+权限执行的三个层次（仅适用于同步 HTTP 路径）：
+
+| 层次 | 机制 | 代码位置 | 异步路径是否绕过 |
+|------|------|----------|:---------:|
+| 身份认证 | `requireSignIn` / `requireAPIKey` 中间件 | [auth.ts](server/src/middlewares/auth.ts), [api.ts](server/src/middlewares/api.ts) | ❌ 完全绕过 |
+| 访问判断 | 每个路由内部 `userId` 条件检查 | 各 `routes/*.ts` 文件 | ❌ 异步函数大多无 |
+| 数据范围限制 | Sequelize 查询中 `where: { userId }` 过滤 | 各路由的数据库查询语句 | ❌ 大多查询无联合条件 |
+
+> ⚠️ **关键注意**：下文 §8 详细分析的 4 条同步→异步边界（B1–B4）显示，系统中大量后台进程（`processQueuedRuns`、`schedule-worker`、`sendWebhook`、`gsheet/airtable` 后处理等）在数据库层面做全表扫描，不区分用户。**userId 过滤不是全局规则，仅是同步 HTTP 路径的规则**。
 
 ---
 
@@ -129,7 +134,9 @@ User (1) ──configures──▶ Proxy Config (1)    // proxy_* 字段直接�
 
 ### 3.2 路由级访问控制
 
-所有路由在挂载时统一应用 `requireSignIn`，部分路由在每个 handler 内部再增加二次检查：
+> 本节描述 HTTP 路由层的访问控制。**异步路径（队列、调度、集成后处理等）不经过路由层，完全绕过本节所有机制**，详见 §8。
+
+所有 HTTP 路由在挂载时统一应用 `requireSignIn` 或 `requireAPIKey`，部分路由在每个 handler 内部再增加二次检查：
 
 | 路由文件 | 中间件 | 二次检查模式 |
 |----------|--------|-------------|
@@ -178,9 +185,11 @@ io.of('/queued-run').on('connection', (socket) => {
 
 ## 4. 数据范围限制（Data Scope Limitation）
 
-### 4.1 核心过滤模式
+> ⚠️ **范围声明**：本节描述的三种过滤模式和资源范围表，**仅适用于同步 HTTP 路径**（受 `requireSignIn` / `requireAPIKey` 保护的路由 handler）。异步路径（队列、调度、集成后处理、Webhook 发送、Socket 通道等）的数据范围限制与本节描述差异很大，详细分析见 §8–§11。
 
-所有数据访问都遵循 **"先认证，再按 userId 过滤"** 的模式：
+### 4.1 同步路径的核心过滤模式
+
+在同步 HTTP 路径中，所有数据访问都遵循 **"先认证，再按 userId 过滤"** 的模式，有三种典型模式：
 
 #### 模式一：直接过滤（最常见）
 
@@ -223,7 +232,9 @@ await Robot.destroy({
 });
 ```
 
-### 4.2 各资源类型的数据范围
+### 4.2 同步路径下各资源类型的数据范围
+
+> 下表描述的是**同步 HTTP 路由 handler 中的数据访问模式**。异步路径下同一资源的访问方式差异显著（见 §8 联合过滤缺口矩阵）。
 
 | 资源 | 查询过滤方式 | 写入归属 | 代码示例 |
 |------|-------------|---------|----------|
@@ -254,6 +265,8 @@ private userToBrowserMap: Map<string, string[]> = {}; // userId → [browserId, 
 - `getUserForBrowser` 可反向查询 browserId → userId
 - `reserveBrowserSlotAtomic` 原子化预留槽位防竞态
 
+> ⚠️ **异步路径缺口**：`getRemoteBrowser(id)` 方法**仅按 browserId 查找，不校验 userId**。在异步任务路径中（如 `processRunExecution`），如果 browserId 来源不可信，可直接获取到任意用户的浏览器实例。详见 §11.6 和 N4 风险。
+
 ### 4.4 Robot 名称唯一性约束
 
 Robot 名称在 **同一用户范围内** 唯一：
@@ -275,7 +288,9 @@ const robots = await Robot.findAll({
 
 ---
 
-## 5. 权限协作流程图
+## 5. 同步路径权限协作流程图
+
+> 本节展示的三条链路均为**同步 HTTP / WebSocket 路径**。异步队列、调度 worker、集成后处理等路径的权限流转差异很大，详见 §8–§11。
 
 ### 5.1 Web UI 请求的完整权限链路
 
