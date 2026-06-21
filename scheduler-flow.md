@@ -10,13 +10,16 @@
 
 | 触发源 | 非文档机器人执行路径 | 文档机器人执行路径 | Graphile Worker 队列 | Run 初始状态 | Run 来源标记 |
 |--------|-------------------|------------------|--------------------|-------------|------------|
-| ① **Cron 定时** | `SCHEDULED_WORKFLOW` → `scheduler/handleRunRecording()` → socket → `scheduler/executeRun()` | `SCHEDULED_WORKFLOW` → socket → 二次入队 `EXECUTE_RUN` → `processRunExecution()` | ✅ 走队列（`SCHEDULED_WORKFLOW`，重试 6 次） | `scheduled` | `runByScheduleId` |
+| ① **Cron 定时** | `SCHEDULED_WORKFLOW` → `scheduler/handleRunRecording()` → socket → `scheduler/executeRun()` | `SCHEDULED_WORKFLOW` → `createWorkflow` 内直接二次入队 `EXECUTE_RUN` → `processRunExecution()` **（无 socket）** | ✅ 走队列（`SCHEDULED_WORKFLOW`，重试 6 次） | `scheduled` | `runByScheduleId` |
 | ② **前端手动** | 直接入队 `EXECUTE_RUN` → `processRunExecution()` | 同左 | ✅ 走队列（`EXECUTE_RUN`，不重试） | `running` / `queued` | 无 |
 | ③ **REST API** | **不走队列**，socket 直调 → `api/executeRun()` | 入队 `EXECUTE_RUN` → `processRunExecution()` | 非文档❌；文档✅（`EXECUTE_RUN`） | `running` | `runByAPI` |
 | ④ **SDK / CLI** | **不走队列**，socket 直调 → `api/executeRun()` | 入队 `EXECUTE_RUN` → `processRunExecution()` | 非文档❌；文档✅（`EXECUTE_RUN`） | `running` | `runBySDK` / `runByCLI` |
 | ⑤ **MCP Worker** | **不走队列**，socket 直调 → `api/executeRun()` | 入队 `EXECUTE_RUN` → `processRunExecution()` | 非文档❌；文档✅（`EXECUTE_RUN`） | `running` | `runByMCP` |
 
-> **关键结论**：外部调用（API/SDK/CLI/MCP）的非文档任务与 Cron 定时队列 **完全没有交集**——它们是两条完全独立的路径，只是因为 `handleRunRecording` 函数同名（分属 `scheduler/index.ts` 和 `api/record.ts` 两个不同文件）才容易混淆。
+> **关键结论**：
+> 1. 外部调用（API/SDK/CLI/MCP）的非文档任务与 Cron 定时队列 **完全没有交集**——它们是两条完全独立的路径，只是因为 `handleRunRecording` 函数同名（分属 `scheduler/index.ts` 和 `api/record.ts` 两个不同文件）才容易混淆。
+> 2. **Cron 文档机器人** 不走 socket，在 `createWorkflowAndStoreMetadata` 内直接二次入队 `EXECUTE_RUN` 后立即 return，与其他所有文档机器人汇合到 `processRunExecution` 队列路径。
+> 3. **Cron 非文档机器人** 走 socket 等待浏览器就绪，调用 `scheduler/executeRun()`，不经过 `EXECUTE_RUN` 队列。
 
 ---
 
@@ -55,23 +58,23 @@
     │ ├─ createWorkflowAndStoreMetadata()          │                    ┌───────▼────────┐              ┌──────────▼──────────┐
     │ │  Run.status='scheduled'                    │                    │ ②前端(有/无槽)   │              │ ③~⑤ 外部调用          │
     │ │  runByScheduleId                           │                    │ processRun-      │              │ createWorkflowAnd-    │
-    │ │  文档机器人: addJob(EXECUTE_RUN)            │                    │ Execution()      │              │ StoreMetadata()       │
-    │ │                                             │                    │ task-runner.ts:130│             │ server/src/api/       │
-    │ └─ 非文档机器人: socket →                     │                    └────────┬─────────┘              │ record.ts:552         │
-    │      'ready-for-run' → executeRun()          │                             │                        │ Run.status='running'  │
-    │      scheduler/index.ts:186-832              │                             │                        │ runByAPI/SDK/MCP/CLI  │
-    └──────────────────────────┬───────────────────┘                             │                        │                        │
-                               │                                                 │                        └───────────┬────────────┘
-                               │                                                 │                                    │
-                               │                                                 │                           ┌────────┴──────────┐
-                               │                                                 │                           │                   │
-                               │                                                 │                      ┌────▼────┐      ┌─────▼──────┐
+    │ │  ┌─ 文档机器人: addJob(EXECUTE_RUN) ─────┐ │                    │ Execution()      │              │ StoreMetadata()       │
+    │ │  │  (createWorkflow 内部直接入队)        │ │                    │ task-runner.ts:130│             │ server/src/api/       │
+    │ │  │  【无 socket，直接 return】           │ │                    └────────┬─────────┘              │ record.ts:552         │
+    │ │  └───────────────┬───────────────────────┘ │                             │                        │ Run.status='running'  │
+    │ │                  │                         │                             │                        │ runByAPI/SDK/MCP/CLI  │
+    │ │                  ▼                         │                             │                        │                        │
+    │ │     EXECUTE_RUN (二次入队)                 │                             │                        └───────────┬────────────┘
+    │ └─ 非文档机器人: socket →                     │                             │                                    │
+    │      'ready-for-run' → executeRun()          │                             │                           ┌────────┴──────────┐
+    │      scheduler/index.ts:186-832              │                             │                           │                   │
+    └──────────────────────────┬───────────────────┘                             │                      ┌────▼────┐      ┌─────▼──────┐
                                │                                                 │                      │ 文档机器人│      │ 非文档机器人 │
                                │                                                 │                      │ 入队      │      │ socket 直调  │
                                │                                                 │                      │EXECUTE_RUN│      │ 不经过队列   │
                                │                                                 │                      └────┬─────┘      └──────┬───────┘
-                               │                                                 │                           │                 │
-                               └──────────────────────┬──────────────────────────┘                           │                 ▼
+                               └──────────────────────┬──────────────────────────┘                           │                 │
+                                                      │                                                          │                 ▼
                                                       │                                                          │  ready-for-run
                                                       │                                                          │  → executeRun()
                                                       ▼                                                          │  api/record.ts:732
@@ -79,6 +82,7 @@
                                     │     Graphile Worker: EXECUTE_RUN            │                              │
                                     │     task-runner.ts:660-662                   │                              │
                                     │     → processRunExecution(payload)           │                              │
+                                    │     (前端手动 + 所有文档机器人)                │                              │
                                     └───────────────────┬─────────────────────────┘                              │
                                                         │                                                          │
                                                         ▼                                                          ▼
@@ -89,8 +93,8 @@
                                     │  task-runner.ts:130-582   api/record.ts:732-1401  workflow-management/         │
                                     │                                                   scheduler/index.ts:186-832   │
                                     │                                                                                │
-                                    │  · 通用队列处理器         · API/SDK/CLI/MCP专用   · Cron专用                    │
-                                    │  · 前端手动 + 所有文档    · 外部调用非文档机器人   · Cron非文档机器人            │
+                                    │  · 通用队列处理器         · API/SDK/CLI/MCP专用   · Cron非文档专用              │
+                                    │  · 前端手动 + 所有文档    · 外部调用非文档机器人                               │
                                     └───────────────────────────────────────────────────────┬───────────────────────┘
                                                                             ▼
                                                           ┌──────────────────────────────────────────┐
@@ -105,7 +109,7 @@
 
 ### 3.1 触发源 ①：Cron 定时调度
 
-**完整链路：DB轮询认领 → SCHEDULED_WORKFLOW队列 → scheduler/handleRunRecording → (socket或二次入队EXECUTE_RUN)**
+**完整链路：DB轮询认领 → SCHEDULED_WORKFLOW队列 → scheduler/handleRunRecording → 【非文档: socket→executeRun】 / 【文档: createWorkflow内直接二次入队EXECUTE_RUN，无socket】**
 
 #### Step 1：服务启动时注册轮询
 
@@ -186,7 +190,7 @@ async function createWorkflowAndStoreMetadata(id, userId) {
     await addJob(QUEUE_NAMES.EXECUTE_RUN,
       { userId, runId, browserId },
       { maxAttempts: 1 }
-    )  // server/src/workflow-management/scheduler/index.ts:86-89
+    )  // server/src/workflow-management/scheduler/index.ts:115-121
   }
   return { browserId, runId, isDocRobot }
 }
@@ -517,7 +521,7 @@ export async function addJob(
 | 触发源 | 机器人类型 | 是否入队 | 队列名 | maxAttempts | 精确入队位置 |
 |--------|----------|---------|--------|-------------|------------|
 | ① Cron | 非文档 | ✅ | `SCHEDULED_WORKFLOW` | **6** | `server/src/schedule-worker.ts:143` |
-| ① Cron | 文档 | ✅ 两次: 先 SCHEDULED_WORKFLOW, 二次 EXECUTE_RUN | `SCHEDULED_WORKFLOW` → `EXECUTE_RUN` | 6 → 1 | 二次入队: `server/src/workflow-management/scheduler/index.ts:86-89` |
+| ① Cron | 文档 | ✅ 两次: 先 SCHEDULED_WORKFLOW, **createWorkflow 内直接二次入队** EXECUTE_RUN（无 socket，直接 return） | `SCHEDULED_WORKFLOW` → `EXECUTE_RUN` | 6 → 1 | 二次入队: `server/src/workflow-management/scheduler/index.ts:115-121` |
 | ② 前端手动(有槽) | 任意 | ✅ | `EXECUTE_RUN` | **1** | `server/src/routes/storage.ts:1069` |
 | ② 前端手动(排队后) | 任意 | ✅ | `EXECUTE_RUN` | **1** | `server/src/routes/storage.ts:1539` |
 | ③ API | 文档 | ✅ | `EXECUTE_RUN` | **1** | `server/src/api/record.ts:632-636` |
@@ -646,8 +650,11 @@ consecutiveDbErrors >= 3
                                                                    │
   虽然执行逻辑高度相似，但有三份独立实现：                            │
   · processRunExecution  task-runner.ts:130-582   队列路径          │
+  ·  适用范围: 前端手动(有槽/排队) + 所有文档机器人(Cron/API/SDK/CLI/MCP) │
   · executeRun (api版)  api/record.ts:732-1401   外部调用非文档      │
+  ·  适用范围: API/SDK/CLI/MCP 非文档机器人                           │
   · executeRun (scheduler版) scheduler/index.ts:186-832 Cron非文档  │
+  ·  适用范围: Cron 非文档机器人（Cron 文档机器人不经过这里，二次入队后走 processRunExecution）│
                                                                    │
 节点 4 [状态更新统一出口] ──────────────────────────────────────────┘
 
