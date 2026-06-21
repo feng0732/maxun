@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档分析 maxun 项目中工作流（Workflow）JSON 模型在**节点数据生成**、**序列化持久化**、**回放执行**三个阶段之间的流转关系和代码实现。
+本文档分析 maxun 项目中工作流（Workflow）JSON 模型在**节点数据生成**、**序列化持久化**、**回放执行**三个阶段之间的流转关系和代码实现。所有描述严格对照实际代码行为。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1.1 类型定义
 
-文件位置：[maxun-core/src/types/workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/types/workflow.ts)
+文件位置：`maxun-core/src/types/workflow.ts`
 
 ```typescript
 // 最顶层的工作流文件结构
@@ -52,7 +52,7 @@ export type What = {
 
 ### 1.2 数据库存储模型
 
-文件位置：[server/src/models/Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts)
+文件位置：`server/src/models/Robot.ts`
 
 ```typescript
 // Robot 模型中工作流的持久化字段
@@ -76,7 +76,7 @@ recording: {
 
 #### 输入来源：用户交互事件
 
-文件位置：[server/src/browser-management/inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/browser-management/inputHandlers.ts)
+文件位置：`server/src/browser-management/inputHandlers.ts`
 
 用户在前端浏览器中的所有操作通过 Socket.IO 事件发送到后端：
 
@@ -95,9 +95,9 @@ recording: {
 
 #### 节点生成器：WorkflowGenerator
 
-文件位置：[server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts)
+文件位置：`server/src/workflow-management/classes/Generator.ts`
 
-核心方法 `addPairToWorkflowAndNotifyClient`（第 295 行）：
+核心方法 `addPairToWorkflowAndNotifyClient`（第 295 行附近）：
 
 ```typescript
 private addPairToWorkflowAndNotifyClient = async (pair: WhereWhatPair, page: Page) => {
@@ -106,7 +106,7 @@ private addPairToWorkflowAndNotifyClient = async (pair: WhereWhatPair, page: Pag
     const match = selectorAlreadyInWorkflow(pair.where.selectors[0], this.workflowRecord.workflow);
     if (match) {
       // 合并到已有节点的 what 数组
-      this.workflowRecord.workflow[matchedIndex].what = 
+      this.workflowRecord.workflow[matchedIndex].what =
         this.workflowRecord.workflow[matchedIndex].what.concat(pair.what);
       matched = true;
     }
@@ -135,7 +135,7 @@ private addPairToWorkflowAndNotifyClient = async (pair: WhereWhatPair, page: Pag
 
 #### 工作流优化：输入状态合并
 
-文件位置：[server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L1417-L1518)
+文件位置：`server/src/workflow-management/classes/Generator.ts`（第 1417 行 `optimizeWorkflow`）
 
 `optimizeWorkflow` 方法在保存前执行，将分散的键盘输入优化为批量输入：
 
@@ -182,7 +182,7 @@ private optimizeWorkflow = (workflow: WorkflowFile) => {
           if (state.cursorPosition === -1) {
             state.value += key;
           } else {
-            state.value = 
+            state.value =
               state.value.slice(0, state.cursorPosition) +
               key +
               state.value.slice(state.cursorPosition);
@@ -191,7 +191,7 @@ private optimizeWorkflow = (workflow: WorkflowFile) => {
         } else if (key === 'Backspace') {
           // 退格键处理
           if (state.cursorPosition > 0) {
-            state.value = 
+            state.value =
               state.value.slice(0, state.cursorPosition - 1) +
               state.value.slice(state.cursorPosition);
             state.cursorPosition--;
@@ -229,7 +229,7 @@ private optimizeWorkflow = (workflow: WorkflowFile) => {
 };
 ```
 
-**优化效果**：将 10 次 `press` 按键动作优化为 1 次 `type` 批量输入动作，显著提高回放效率。
+**优化效果**：将 N 次 `press` 按键动作优化为 1 次 `type` 批量输入动作，显著提高回放效率。
 
 ---
 
@@ -237,9 +237,7 @@ private optimizeWorkflow = (workflow: WorkflowFile) => {
 
 #### 保存工作流到数据库
 
-文件位置：[server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L1044-L1128)
-
-`saveNewWorkflow` 方法处理保存逻辑：
+文件位置：`server/src/workflow-management/classes/Generator.ts`（第 1044 行 `saveNewWorkflow`）
 
 ```typescript
 public saveNewWorkflow = async (fileName: string, userId: number, isLogin: boolean, robotId?: string) => {
@@ -281,17 +279,17 @@ public saveNewWorkflow = async (fileName: string, userId: number, isLogin: boole
 
 在录制阶段，键盘输入的值会被加密存储：
 
-文件位置：[server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L469-L484)
+文件位置：`server/src/workflow-management/classes/Generator.ts`
 
 ```typescript
 const pair: WhereWhatPair = {
-  where: { 
+  where: {
     url: this.getBestUrl(url),
     selectors: [selector]
   },
   what: [{
     action: 'press',
-    args: [selector, encrypt(key), inputType || 'text'],  // key 被加密
+    args: [selector, encrypt(key), inputType || 'text'],  // key 被 encrypt() 加密
   }],
 };
 ```
@@ -302,7 +300,7 @@ const pair: WhereWhatPair = {
 
 #### 从数据库加载工作流
 
-文件位置：[server/src/routes/workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/routes/workflow.ts#L109-L150)
+文件位置：`server/src/routes/workflow.ts`
 
 ```typescript
 // PUT /workflow/:browserId/:id
@@ -332,7 +330,7 @@ router.put('/:browserId/:id', requireSignIn, async (req: AuthenticatedRequest, r
 
 #### 更新生成器状态
 
-文件位置：[server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L1029-L1036)
+文件位置：`server/src/workflow-management/classes/Generator.ts`
 
 ```typescript
 public updateWorkflowFile = (workflowFile: WorkflowFile, meta: MetaData) => {
@@ -351,7 +349,7 @@ public updateWorkflowFile = (workflowFile: WorkflowFile, meta: MetaData) => {
 
 #### 工作流预处理
 
-文件位置：[maxun-core/src/preprocessor.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/preprocessor.ts)
+文件位置：`maxun-core/src/preprocessor.ts`
 
 `Preprocessor.initWorkflow` 方法在执行前调用：
 
@@ -391,7 +389,7 @@ static initWorkflow(workflow: Workflow, params?: ParamType): Workflow {
 
 #### 输入解密处理
 
-文件位置：[server/src/workflow-management/classes/Interpreter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Interpreter.ts#L14-L48)
+文件位置：`server/src/workflow-management/classes/Interpreter.ts`
 
 ```typescript
 function processWorkflow(workflow: WorkflowFile, checkLimit: boolean = false): WorkflowFile {
@@ -402,7 +400,7 @@ function processWorkflow(workflow: WorkflowFile, checkLimit: boolean = false): W
   processedWorkflow.workflow.forEach((pair) => {
     pair.what.forEach((action) => {
       // 解密 type 和 press 动作中的加密值
-      if ((action.action === 'type' || action.action === 'press') && 
+      if ((action.action === 'type' || action.action === 'press') &&
           Array.isArray(action.args) && action.args.length > 1) {
         try {
           const encryptedValue = action.args[1];
@@ -427,7 +425,7 @@ function processWorkflow(workflow: WorkflowFile, checkLimit: boolean = false): W
 
 #### 核心执行循环
 
-文件位置：[maxun-core/src/interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/interpret.ts#L2915-L2958)
+文件位置：`maxun-core/src/interpret.ts`
 
 ```typescript
 public async run(page: Page, params?: ParamType): Promise<void> {
@@ -445,7 +443,7 @@ public async run(page: Page, params?: ParamType): Promise<void> {
 
 #### runLoop 主循环
 
-文件位置：[maxun-core/src/interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/interpret.ts#L2689-L2872)
+文件位置：`maxun-core/src/interpret.ts`
 
 ```typescript
 private async runLoop(p: Page, workflow: Workflow) {
@@ -470,7 +468,7 @@ private async runLoop(p: Page, workflow: Workflow) {
     // const actionId = workflowCopy.findIndex((step) => {
     //   return this.applicable(step.where, pageState, usedActions);
     // });
-    
+
     // 当前简化实现：从数组末尾开始执行
     const actionId = workflowCopy.length - 1;
     const action = workflowCopy[actionId];
@@ -491,7 +489,7 @@ private async runLoop(p: Page, workflow: Workflow) {
 
 #### 动作执行器
 
-文件位置：[maxun-core/src/interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/interpret.ts#L550-L1953)
+文件位置：`maxun-core/src/interpret.ts`
 
 `carryOutSteps` 方法执行具体的动作：
 
@@ -567,7 +565,7 @@ private async carryOutSteps(page: Page, steps: What[], currentWorkflow?: Workflo
 │                                                                         │
 │  Generator.saveNewWorkflow()                                            │
 │         │                                                               │
-│         ├─► normalizeWorkflowUrls() - URL 标准化                        │
+│         ├─► normalizeWorkflowUrls() - URL 规范化                        │
 │         │                                                               │
 │         ▼                                                               │
 │  Robot.create({                                                         │
@@ -672,18 +670,18 @@ private async carryOutSteps(page: Page, steps: What[], currentWorkflow?: Workflo
 
 | 位置 | 文件 | 代码 | 用途 |
 |-----|------|------|------|
-| 1 | [preprocessor.ts#L168](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/preprocessor.ts#L168) | `JSON.parse(JSON.stringify(workflow))` | 预处理时深拷贝，避免修改原始工作流 |
-| 2 | [interpret.ts#L2695](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/interpret.ts#L2695) | `JSON.parse(JSON.stringify(workflow))` | 执行循环时深拷贝，维护待执行队列 |
-| 3 | [Interpreter.ts#L15](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Interpreter.ts#L15) | `JSON.parse(JSON.stringify(workflow))` | 输入解密前深拷贝 |
-| 4 | [Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts) | Sequelize JSONB 自动处理 | 数据库持久化和读取 |
+| 1 | `maxun-core/src/preprocessor.ts` | `JSON.parse(JSON.stringify(workflow))` | 预处理时深拷贝，避免修改原始工作流 |
+| 2 | `maxun-core/src/interpret.ts` | `JSON.parse(JSON.stringify(workflow))` | 执行循环时深拷贝，维护待执行队列 |
+| 3 | `server/src/workflow-management/classes/Interpreter.ts` | `JSON.parse(JSON.stringify(workflow))` | 输入解密前深拷贝 |
+| 4 | `server/src/models/Robot.ts` | Sequelize JSONB 自动处理 | 数据库持久化和读取 |
 
 ### 4.2 特殊格式转换
 
 | 转换类型 | 存储形式（JSON） | 运行时形式（JS） | 处理位置 |
 |---------|-----------------|-----------------|---------|
-| 正则表达式 | `{ "$regex": "^https://example.com" }` | `RegExp` 对象 | [preprocessor.ts#L183-L187](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/preprocessor.ts#L183-L187) |
-| 参数占位符 | `{ "$param": "username" }` | 实际参数值 | [preprocessor.ts#L171-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/preprocessor.ts#L171-L181) |
-| 敏感输入 | 加密字符串（AES） | 明文字符串 | [Interpreter.ts#L28-L43](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Interpreter.ts#L28-L43) |
+| 正则表达式 | `{ "$regex": "^https://example.com" }` | `RegExp` 对象 | `maxun-core/src/preprocessor.ts` |
+| 参数占位符 | `{ "$param": "username" }` | 实际参数值 | `maxun-core/src/preprocessor.ts` |
+| 敏感输入 | 加密字符串（AES-256-CBC） | 明文字符串 | `server/src/workflow-management/classes/Interpreter.ts` |
 
 ---
 
@@ -706,22 +704,22 @@ private async carryOutSteps(page: Page, steps: What[], currentWorkflow?: Workflo
 
 ---
 
-## 六、关键代码文件索引
+## 六、关键代码文件索引（GUI 录制路径）
 
 | 文件 | 主要职责 |
 |-----|---------|
-| [workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/types/workflow.ts) | 核心类型定义（WhereWhatPair, Workflow 等） |
-| [preprocessor.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/preprocessor.ts) | 工作流验证、参数初始化、正则转换 |
-| [interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/maxun-core/src/interpret.ts) | 工作流解释执行核心（run, runLoop, carryOutSteps） |
-| [Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts) | 录制时节点生成、优化、保存 |
-| [Interpreter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Interpreter.ts) | 服务端解释器包装、输入解密 |
-| [inputHandlers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/browser-management/inputHandlers.ts) | 用户输入事件路由 |
-| [Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts) | 数据库模型定义 |
-| [workflow.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/routes/workflow.ts) | 工作流 REST API |
+| `maxun-core/src/types/workflow.ts` | 核心类型定义（WhereWhatPair, Workflow 等） |
+| `maxun-core/src/preprocessor.ts` | 工作流验证、参数初始化、正则转换 |
+| `maxun-core/src/interpret.ts` | 工作流解释执行核心（run, runLoop, carryOutSteps） |
+| `server/src/workflow-management/classes/Generator.ts` | 录制时节点生成、优化、保存 |
+| `server/src/workflow-management/classes/Interpreter.ts` | 服务端解释器包装、输入解密 |
+| `server/src/browser-management/inputHandlers.ts` | 用户输入事件路由 |
+| `server/src/models/Robot.ts` | 数据库模型定义 |
+| `server/src/routes/workflow.ts` | 工作流 REST API |
 
 ---
 
-## 七、总结
+## 七、总结（GUI 录制路径）
 
 工作流 JSON 模型的流转遵循以下核心原则：
 
@@ -742,7 +740,7 @@ private async carryOutSteps(page: Page, steps: What[], currentWorkflow?: Workflo
 
 ### 8.1 API 入口：POST /api/sdk/robots
 
-文件位置：[server/src/api/sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts#L163-L326)
+文件位置：`server/src/api/sdk.ts`
 
 SDK 用户提交的是"简化格式"的工作流，API 路由处理以下核心步骤：
 
@@ -770,7 +768,7 @@ SDK 请求体（简化格式）
 4. Robot.create() - 写库保存
 ```
 
-核心代码（第 182-300 行）：
+核心代码：
 
 ```typescript
 // 步骤 1：根据类型决定是否需要选择器补全
@@ -818,7 +816,7 @@ const robot = await Robot.create({
 
 ### 8.2 选择器补全：WorkflowEnricher.enrichWorkflow
 
-文件位置：[server/src/sdk/workflowEnricher.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L34-L270)
+文件位置：`server/src/sdk/workflowEnricher.ts`
 
 这是 SDK 路径区别于 GUI 录制的**核心差异化步骤**。它启动一个真实浏览器来验证和补全用户提交的简化选择器。
 
@@ -864,7 +862,7 @@ simplifiedWorkflow（用户提交的简化节点数组）
 
 #### 8.2.1 type 动作：输入检测 + 加密
 
-代码位置：[workflowEnricher.ts#L81-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L81-L118)
+文件位置：`server/src/sdk/workflowEnricher.ts`
 
 ```typescript
 if (action.action === 'type') {
@@ -876,7 +874,7 @@ if (action.action === 'type') {
   const encryptedValue = encrypt(value);
 
   if (!providedInputType) {
-    // 自动检测输入框类型（text, password, email 等）
+    // 自动检测输入框类型
     const inputType = await validator.detectInputType(selector);
     enrichedStep.what.push({
       ...action,
@@ -900,9 +898,34 @@ if (action.action === 'type') {
 
 最终存储格式**完全一致**，均为 `{ action: 'type', args: [selector, encryptedValue, inputType] }`。
 
+**detectInputType 返回值（代码确认）**：
+
+文件位置：`server/src/sdk/selectorValidator.ts`
+
+```typescript
+const inputType = await element.evaluate((el) => {
+  if (el instanceof HTMLInputElement) {
+    return el.type || 'text';
+  }
+  if (el instanceof HTMLTextAreaElement) {
+    return 'textarea';
+  }
+  if (el instanceof HTMLSelectElement) {
+    return 'select';
+  }
+  return 'text';
+});
+```
+
+即：
+- `<input>` 元素返回其 `type` 属性（如 `text`/`password`/`email`/`number`/`search` 等），缺失时返回 `'text'`
+- `<textarea>` 返回 `'textarea'`
+- `<select>` 返回 `'select'`
+- 其他元素返回 `'text'`
+
 #### 8.2.2 scrapeSchema 动作：字段选择器补全
 
-代码位置：[workflowEnricher.ts#L126-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L126-L164)
+文件位置：`server/src/sdk/workflowEnricher.ts`
 
 用户可能只提交了简单的字段名-选择器映射：
 ```json
@@ -937,7 +960,7 @@ if (action.action === 'type') {
 }
 ```
 
-验证由 [SelectorValidator.validateSelector()](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/selectorValidator.ts#L54-L108) 完成，包括：
+验证由 `server/src/sdk/selectorValidator.ts` 的 `validateSelector()` 完成，包括：
 - 检查选择器是否匹配到元素（`count() !== 0`）
 - 获取元素的 `tagName`（H1, DIV, A 等）
 - 检查元素是否在 Shadow DOM 中（`isShadow`）
@@ -945,7 +968,7 @@ if (action.action === 'type') {
 
 #### 8.2.3 scrapeList 动作：列表自动探测
 
-代码位置：[workflowEnricher.ts#L166-L232](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L166-L232)
+文件位置：`server/src/sdk/workflowEnricher.ts`
 
 用户可能只提交了列表容器选择器（itemSelector），系统自动：
 1. **autoDetectListFields()**：遍历列表项的子元素，自动识别标题、价格、图片、链接等常见字段
@@ -969,11 +992,11 @@ if (action.action === 'type') {
 
 ### 8.3 输入加密：AES-256-CBC 对称加密
 
-文件位置：[server/src/utils/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/utils/auth.ts#L26-L61)
+文件位置：`server/src/utils/auth.ts`
 
 SDK 路径与 GUI 录制路径使用**完全相同的加密函数**，确保回放时解密逻辑的一致性。
 
-#### encrypt 实现
+#### encrypt 实现（代码确认）
 
 ```typescript
 export const encrypt = (text: string): string => {
@@ -997,46 +1020,52 @@ export const encrypt = (text: string): string => {
 };
 ```
 
-**加密特征**：
+**加密特征（代码确认）**：
 - **算法**：AES-256-CBC（256 位密钥，密码分组链接模式）
 - **IV 处理**：每次加密生成随机 16 字节 IV，拼接在密文前（相同明文 → 不同密文）
-- **密钥来源**：环境变量 `ENCRYPTION_KEY`，缺失时临时生成（警告：重启后无法解密旧数据）
-- **输出格式**：`ivHex:ciphertextHex`，用冒号分隔
+- **密钥来源**：环境变量 `ENCRYPTION_KEY`，要求 64 个十六进制字符（对应 256 位）；缺失或长度不对时临时生成并打印警告
+- **输出格式**：`ivHex:ciphertextHex`，用冒号分隔两部分（每部分均为十六进制字符串）
 
-#### decrypt 实现（回放时调用）
+#### decrypt 实现（回放时调用，代码确认）
 
 ```typescript
 export const decrypt = (encryptedText: string): string => {
-  const [iv, encrypted] = encryptedText.split(':');  // 拆分 IV 和密文
-  const keyBuffer = Buffer.from(getEnvVariable('ENCRYPTION_KEY'), 'hex');
+  const [iv, encrypted] = encryptedText.split(':');  // 按冒号拆分 IV 和密文
+  const algorithm = "aes-256-cbc";
 
-  const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, Buffer.from(iv, 'hex'));
+  let key = getEnvVariable('ENCRYPTION_KEY');
+  if (!key || key.length !== 64) {
+    key = crypto.randomBytes(32).toString('hex');
+  }
+  const keyBuffer = Buffer.from(key, 'hex');
+
+  const decipher = crypto.createDecipheriv(algorithm, keyBuffer, Buffer.from(iv, 'hex'));
   let decrypted = decipher.update(encrypted, 'hex', 'utf8');
   decrypted += decipher.final('utf8');
   return decrypted;
 };
 ```
 
-**加密发生的三个位置**：
+**加密发生的三个位置（代码确认）**：
 
-| 位置 | 场景 | 代码位置 |
-|-----|------|---------|
-| 1 | SDK `type` 动作补全时 | [workflowEnricher.ts#L93](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts#L93) |
-| 2 | GUI 录制键盘输入时 | [Generator.ts#L481](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L481) |
-| 3 | GUI 优化后生成 type 动作时 | [Generator.ts#L1487](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Generator.ts#L1487) |
+| 位置 | 场景 | 文件 |
+|-----|------|------|
+| 1 | SDK `type` 动作补全时 | `server/src/sdk/workflowEnricher.ts`（`encrypt(value)` 调用） |
+| 2 | GUI 录制键盘 `press` 动作时 | `server/src/workflow-management/classes/Generator.ts`（`encrypt(key)` 调用） |
+| 3 | GUI `optimizeWorkflow` 合并生成 `type` 动作时 | `server/src/workflow-management/classes/Generator.ts`（`encrypt(state.value)` 调用） |
 
-**解密发生的位置**：
-- [Interpreter.ts#processWorkflow](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/workflow-management/classes/Interpreter.ts#L14-L48)：所有工作流回放前统一解密
+**解密发生的位置（代码确认）**：
+- `server/src/workflow-management/classes/Interpreter.ts` 的 `processWorkflow()`：所有工作流回放前统一解密 `type` 和 `press` 动作的 `args[1]`
 
 ---
 
-### 8.4 URL 规范化：三个层次的处理
+### 8.4 URL 规范化：严格按代码确认的行为
 
-URL 规范化在 SDK 路径中被调用了**多次**，确保 URL 格式统一，避免因格式差异导致的 URL 匹配失败。
+URL 规范化在 SDK 路径中被调用多次。代码库中实际存在两个不同的规范化函数，用途不同，以下描述严格基于实际代码。
 
-#### 8.4.1 normalizeRobotUrl：单 URL 规范化
+#### 8.4.1 normalizeRobotUrl：存储用 URL 规范化（代码确认）
 
-文件位置：[sdk.ts#L67-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts#L67-L75)
+该函数在三处独立定义但实现完全一致：`server/src/api/sdk.ts`、`server/src/workflow-management/classes/Generator.ts`、`server/src/routes/storage.ts`。
 
 ```typescript
 const normalizeRobotUrl = (rawUrl: string): string => {
@@ -1044,83 +1073,136 @@ const normalizeRobotUrl = (rawUrl: string): string => {
   if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
     throw new Error('Invalid URL protocol');
   }
-  // 通过 searchParams.toString() 标准化查询参数顺序/编码
   normalizedUrl.search = normalizedUrl.searchParams.toString();
   return normalizedUrl.toString();
 };
 ```
 
-**处理内容**：
-1. 去除前后空白字符
-2. 协议校验（仅允许 http/https）
-3. 重新序列化查询参数（统一参数顺序和 URL 编码）
+**实际执行的操作（严格按代码）**：
+1. `rawUrl.trim()`：去除字符串前后空白字符
+2. `new URL(...)`：用 WHATWG URL 构造器解析，解析失败直接抛错
+3. 协议校验：仅允许 `http:` 或 `https:`，否则抛 `Invalid URL protocol`
+4. `normalizedUrl.search = normalizedUrl.searchParams.toString()`：通过 `searchParams` 重新序列化查询字符串（统一参数顺序和 URL 编码格式）
+5. `normalizedUrl.toString()`：输出完整 URL 字符串
 
-#### 8.4.2 normalizeWorkflowUrls：遍历工作流规范化
+**代码未执行的操作（明确排除）**：
+- 未做 `host.toLowerCase()` 主机名小写转换
+- 未做 `pathname.replace(/\/$/, '')` 尾斜杠移除
+- 未修改端口号、用户名、密码、hash 等其他 URL 组成部分
 
-文件位置：[sdk.ts#L77-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts#L77-L125)
+#### 8.4.2 normalizeUrl：比较用 URL 规范化（代码确认，仅用于名称去重）
 
-遍历工作流的三个位置：
-1. **pair.where.url**：节点的执行条件 URL
-2. **goto 动作的 args[0]**：页面跳转 URL
-3. **scrape/crawl 动作的 args[0].url**：爬取入口 URL
+仅定义于 `server/src/api/sdk.ts`，用于 `findExistingRobotByName()` 中比较机器人是否已存在。
+
+```typescript
+const normalizeUrl = (raw: string): string => {
+  try {
+    const u = new URL(raw);
+    u.search = u.searchParams.toString();
+    return `${u.protocol}//${u.host.toLowerCase()}${u.pathname.replace(/\/$/, '')}${u.search}`;
+  } catch {
+    return raw.toLowerCase().trim();
+  }
+};
+```
+
+**实际执行的操作（严格按代码）**：
+1. `new URL(raw)`：解析 URL，失败则降级为 `raw.toLowerCase().trim()`
+2. `u.search = u.searchParams.toString()`：重新序列化查询参数
+3. `u.host.toLowerCase()`：主机名转小写
+4. `u.pathname.replace(/\/$/, '')`：移除 pathname 末尾的单个斜杠
+5. 手动拼接：`protocol + // + host(小写) + pathname(去尾斜杠) + search`
+
+**用途**：仅用于**判断是否已有同名机器人**时的 URL 等值比较，不用于写入存储。
+
+#### 8.4.3 normalizeWorkflowUrls：遍历工作流规范化（代码确认）
 
 ```typescript
 const normalizeWorkflowUrls = (workflow: any[] = []): any[] =>
   workflow.map((pair: any) => ({
     ...pair,
-    where: {
-      ...pair.where,
-      url: typeof pair.where.url === 'string' && pair.where.url !== 'about:blank'
-        ? normalizeRobotUrl(pair.where.url)
-        : pair.where.url
-    },
-    what: pair.what.map((action: any) => {
-      if (action.action === 'goto' && action.args?.[0] !== 'about:blank') {
-        return { ...action, args: [normalizeRobotUrl(action.args[0]), ...action.args.slice(1)] };
-      }
-      if ((action.action === 'scrape' || action.action === 'crawl') && action.args?.[0]?.url) {
-        return {
-          ...action,
-          args: [{ ...action.args[0], url: normalizeRobotUrl(action.args[0].url) }, ...action.args.slice(1)]
-        };
-      }
-      return action;
-    })
+    where: pair?.where
+      ? {
+          ...pair.where,
+          ...(typeof pair.where.url === 'string' && pair.where.url !== 'about:blank'
+            ? { url: normalizeRobotUrl(pair.where.url) }
+            : {}),
+        }
+      : pair?.where,
+    what: Array.isArray(pair?.what)
+      ? pair.what.map((action: any) => {
+          if (
+            action.action === 'goto' &&
+            Array.isArray(action.args) &&
+            typeof action.args[0] === 'string' &&
+            action.args[0] !== 'about:blank'
+          ) {
+            return {
+              ...action,
+              args: [normalizeRobotUrl(action.args[0]), ...action.args.slice(1)],
+            };
+          }
+
+          if (
+            (action.action === 'scrape' || action.action === 'crawl') &&
+            Array.isArray(action.args) &&
+            action.args[0] &&
+            typeof action.args[0] === 'object' &&
+            typeof action.args[0].url === 'string' &&
+            action.args[0].url !== 'about:blank'
+          ) {
+            return {
+              ...action,
+              args: [
+                {
+                  ...action.args[0],
+                  url: normalizeRobotUrl(action.args[0].url),
+                },
+                ...action.args.slice(1),
+              ],
+            };
+          }
+
+          return action;
+        })
+      : pair?.what,
   }));
 ```
 
-#### 8.4.3 SDK 路径中的规范化调用时序
+**实际遍历并调用 `normalizeRobotUrl` 的三个位置（严格按代码）**：
+1. **`pair.where.url`**：当类型为 `string` 且值不为 `'about:blank'` 时
+2. **`goto` 动作的 `args[0]`**：当 `args` 是数组、`args[0]` 为 `string` 且值不为 `'about:blank'` 时
+3. **`scrape` 或 `crawl` 动作的 `args[0].url`**：当 `args` 是数组、`args[0]` 为对象、`args[0].url` 为 `string` 且值不为 `'about:blank'` 时
+
+**特殊规则（代码确认）**：值为字符串 `'about:blank'` 时**跳过规范化**（作为起始标记保留原字面量）。
+
+#### 8.4.4 SDK 路径中的规范化调用时序（代码确认）
 
 ```
 enrichWorkflow 完成
     │
     ├─► enrichedWorkflow = normalizeWorkflowUrls(enrichResult.workflow)
-    │     第一次：对 enricher 返回的工作流规范化
+    │     第 1 次：对 enricher 返回的工作流整体遍历规范化
     │
     ▼
-extractUrl = normalizeRobotUrl(enrichResult.url)
-    │     第二次：对入口 URL 规范化
+extractedUrl = normalizeRobotUrl(enrichResult.url)
+    │     第 2 次：对入口 URL 单独规范化（写入 recording_meta.url）
     │
     ▼
 写入 Robot.create 时:
     recording.workflow = normalizeWorkflowUrls(enrichedWorkflow)
-          第三次：写库前再次规范化（双重保险）
+          第 3 次：写库前再次对工作流遍历规范化
 ```
-
-**为什么多次规范化？**
-- `enrichWorkflow` 内部使用浏览器导航，可能引入新的 URL
-- 写库前再次规范化确保不因后续处理逻辑引入格式差异
-- `'about:blank'` 特殊处理：空页标识不做规范化（作为起始标记保留）
 
 ---
 
 ### 8.5 写库保存：Robot.create 的最终写入
 
-文件位置：[server/src/models/Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts)
+文件位置：`server/src/models/Robot.ts`
 
 SDK 路径与 GUI 录制路径在**写库阶段完全一致**，均通过 Sequelize 的 `Robot.create()` 写入 PostgreSQL。
 
-#### 写入数据结构
+#### 写入数据结构（代码确认）
 
 ```typescript
 Robot.create({
@@ -1191,7 +1273,7 @@ JSON.stringify(obj) 自动序列化
 写入数据库列
 ```
 
-**关键点**：应用层代码**不需要显式调用 `JSON.stringify()`**。Sequelize 的 `DataTypes.JSONB` 类型定义会在保存时自动完成序列化，读取时自动完成 `JSON.parse()` 反序列化。
+**关键点（代码确认）**：应用层代码**不需要显式调用 `JSON.stringify()`**。Sequelize 的 `DataTypes.JSONB` 类型定义会在保存时自动完成序列化，读取时自动完成 `JSON.parse()` 反序列化。
 
 #### 与 GUI 录制路径的写入对比
 
@@ -1200,8 +1282,8 @@ JSON.stringify(obj) 自动序列化
 | 入口 | `Generator.saveNewWorkflow()` | `POST /api/sdk/robots` |
 | 节点生成 | 实时生成（Socket 事件驱动） | 一次性提交（HTTP 请求体） |
 | 选择器来源 | 浏览器自动录制 | 用户提交 + 浏览器补全（enrichWorkflow） |
-| 输入处理 | 逐键 press → 优化为 type | 直接 type → 加密补全 inputType |
-| URL 规范化 | `normalizeWorkflowUrls()` 一次 | 多次调用 normalizeRobotUrl/Urls |
+| 输入处理 | 逐键 press → optimizeWorkflow 合并为 type | 直接 type → encrypt 加密 + detectInputType 补全 |
+| URL 规范化 | `normalizeWorkflowUrls()` 一次 | `normalizeWorkflowUrls()` 两次 + `normalizeRobotUrl()` 一次 |
 | 写库函数 | `Robot.create()` | `Robot.create()` |
 | 存储格式 | **完全一致** | **完全一致** |
 | 回放加载 | **完全一致** | **完全一致** |
@@ -1241,9 +1323,10 @@ JSON.stringify(obj) 自动序列化
 │  ┌─ type 动作 ──────────────────────────────────────────────┐           │
 │  │  selector → 加入 where.selectors 集合                    │           │
 │  │  value    → encrypt(value) 加密                          │           │
-│  │             （AES-256-CBC，随机 IV）                      │           │
+│  │             （AES-256-CBC，随机 16 字节 IV，输出 ivHex:密文Hex）       │
 │  │  inputType→ validator.detectInputType() 自动检测          │           │
-│  │             （或使用用户提供的第三个参数）                  │           │
+│  │             （HTMLInputElement.type / 'textarea' /        │           │
+│  │              'select' / 'text'）                          │           │
 │  │  自动追加: waitForLoadState(networkidle)                 │           │
 │  └───────────────────────────────────────────────────────────┘           │
 │                                                                         │
@@ -1264,19 +1347,26 @@ JSON.stringify(obj) 自动序列化
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                   步骤 2：URL 规范化（多次调用）                           │
+│           步骤 2：URL 规范化（严格按代码确认的行为）                        │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  第 1 次: normalizeWorkflowUrls(enrichedWorkflow)                       │
-│    ├─ pair.where.url          → 去除尾斜杠，统一 query 编码              │
-│    ├─ goto.args[0]            → 去除尾斜杠，统一 query 编码              │
-│    └─ scrape/crawl.args[0].url → 去除尾斜杠，统一 query 编码             │
+│  normalizeRobotUrl 实际执行：                                            │
+│    1. rawUrl.trim()                     ← 去前后空白                    │
+│    2. new URL(...) 解析 + 协议校验        ← 仅 http/https                │
+│    3. search = searchParams.toString()   ← 重新序列化 query              │
+│    4. .toString() 输出                   ← 完整 URL 字符串               │
+│    （代码未执行：主机小写 / 去尾斜杠，两者仅 normalizeUrl 比较时才做）       │
 │                                                                         │
-│  第 2 次: normalizeRobotUrl(enrichResult.url)  ← 入口 URL               │
+│  normalizeWorkflowUrls 遍历三处：                                        │
+│    ① pair.where.url                      (字符串且 ≠ 'about:blank')     │
+│    ② goto.args[0]                        (字符串且 ≠ 'about:blank')     │
+│    ③ scrape/crawl.args[0].url            (字符串且 ≠ 'about:blank')     │
 │                                                                         │
-│  第 3 次: normalizeWorkflowUrls(enrichedWorkflow) ← 写库前双重保险       │
+│  第 1 次: normalizeWorkflowUrls(enrichedWorkflow)  ← enricher 输出后     │
+│  第 2 次: normalizeRobotUrl(enrichResult.url)      ← 入口 URL 单独       │
+│  第 3 次: normalizeWorkflowUrls(enrichedWorkflow)  ← 写库前再遍历一次     │
 │                                                                         │
-│  特殊规则: "about:blank" → 跳过规范化（起始标记）                       │
+│  特殊规则: 值为字面量 "about:blank" → 跳过规范化（保留作起始标记）         │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
                               │
@@ -1302,8 +1392,8 @@ JSON.stringify(obj) 自动序列化
 │  Robot.create({                                                         │
 │    id: uuid(),                                                          │
 │    userId: user.id,                                                     │
-│    recording_meta: robotMeta,    ← DataTypes.JSONB 自动序列化            │
-│    recording: {                   ← DataTypes.JSONB 自动序列化            │
+│    recording_meta: robotMeta,    ← DataTypes.JSONB 自动 JSON.stringify   │
+│    recording: {                   ← DataTypes.JSONB 自动 JSON.stringify   │
 │      workflow: normalizeWorkflowUrls(enrichedWorkflow)                  │
 │    }                                                                    │
 │    ...其他字段                                                           │
@@ -1320,7 +1410,7 @@ JSON.stringify(obj) 自动序列化
 │                     后续：与 GUI 录制路径完全共用                          │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  • 从数据库加载：Robot.findOne() → Sequelize 自动反序列化                │
+│  • 从数据库加载：Robot.findOne() → Sequelize 自动 JSON.parse 反序列化     │
 │  • 回放前：processWorkflow() 解密 AES 加密的 type/press 值              │
 │  • 预处理：Preprocessor.initWorkflow() 转换 $regex/$param              │
 │  • 执行：Interpreter.run() → runLoop() → carryOutSteps()                │
@@ -1334,22 +1424,26 @@ JSON.stringify(obj) 自动序列化
 
 | 文件 | 主要职责 | 关键函数/方法 |
 |-----|---------|-------------|
-| [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/api/sdk.ts) | SDK API 路由，统一入口 | `POST /sdk/robots`、`normalizeRobotUrl`、`normalizeWorkflowUrls` |
-| [workflowEnricher.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/workflowEnricher.ts) | 选择器补全核心 | `enrichWorkflow()`、`generateWorkflowFromPrompt()` |
-| [selectorValidator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/sdk/selectorValidator.ts) | 浏览器端选择器验证 | `validateSelector()`、`detectInputType()`、`validateSchemaFields()` |
-| [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/utils/auth.ts) | 敏感数据加解密 | `encrypt()` (AES-256-CBC)、`decrypt()` |
-| [Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/109-maxun/server/src/models/Robot.ts) | 数据库模型（共享） | `Robot.init()` 中 JSONB 字段定义 |
+| `server/src/api/sdk.ts` | SDK API 路由，统一入口 | `POST /sdk/robots`、`normalizeRobotUrl`、`normalizeWorkflowUrls`、`normalizeUrl`（仅比较用） |
+| `server/src/sdk/workflowEnricher.ts` | 选择器补全核心 | `enrichWorkflow()`、`generateWorkflowFromPrompt()` |
+| `server/src/sdk/selectorValidator.ts` | 浏览器端选择器验证 | `validateSelector()`、`detectInputType()`、`validateSchemaFields()` |
+| `server/src/utils/auth.ts` | 敏感数据加解密 | `encrypt()` (AES-256-CBC)、`decrypt()` |
+| `server/src/models/Robot.ts` | 数据库模型（与 GUI 共享） | `Robot.init()` 中 JSONB 字段定义 |
 
 ---
 
-### 8.8 SDK 路径核心结论
+### 8.8 SDK 路径核心结论（严格代码确认）
 
 1. **两种路径，统一存储**：SDK 简化工作流经过补全、加密、规范化后，写入数据库的 `WhereWhatPair` 结构与 GUI 录制路径**完全一致**
 
 2. **选择器补全的本质**：启动真实浏览器验证用户提交的选择器，补全 `tag`、`isShadow`、`attribute` 等元数据，并将选择器集合写入 `where.selectors` 字段
 
-3. **加密一致性**：SDK 的 `type` 动作直接调用 `encrypt()`，跳过了 GUI 的逐键 `press` → 优化为 `type` 的过程，但加密算法和存储格式与 GUI 路径完全相同
+3. **加密一致性**：SDK 的 `type` 动作直接调用 `encrypt()`，跳过了 GUI 的逐键 `press` → 优化为 `type` 的过程，但加密算法（AES-256-CBC，输出 `ivHex:ciphertextHex`）和存储格式与 GUI 路径完全相同
 
-4. **URL 规范化的三道保险**：enricher 输出后一次、入口 URL 单独一次、写库前再次一次，确保 `where.url`、`goto` 动作、`scrape/crawl` 动作三处的 URL 格式统一
+4. **URL 规范化的明确边界**：
+   - `normalizeRobotUrl` 做：`trim()` → 协议校验 → `searchParams.toString()` 重新序列化 query → `.toString()` 输出
+   - `normalizeRobotUrl` **不做**：主机名小写、尾斜杠去除（这两者仅存在于 `normalizeUrl`，且仅用于同名机器人比较场景）
+   - `normalizeWorkflowUrls` 遍历：`where.url`、`goto.args[0]`、`scrape/crawl.args[0].url` 三处，字面量 `'about:blank'` 一律跳过
+   - SDK 路径中调用时序：enricher 输出后 1 次、入口 URL 1 次、写库前再 1 次
 
 5. **后续阶段零差异**：一旦写入数据库，加载、预处理、回放执行的所有步骤，SDK 路径与 GUI 录制路径**完全共用相同的代码**
