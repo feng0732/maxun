@@ -99,7 +99,62 @@ if (!slotReserved) {
 }
 ```
 
-异常被 `createWorkflowAndStoreMetadata` 的 catch 捕获，返回 `{ success: false, error: message }`，随后 `handleRunRecording` 因为拿不到 `runId` 再次 throw，整个 `SCHEDULED_WORKFLOW` 任务失败（Graphile Worker 会按 `maxAttempts: 6` 重试）。
+#### 1.2.4 错误传播链与 maxAttempts 失效分析
+
+**⚠️ 关键发现：`maxAttempts: 6` 在浏览器槽位不足场景下完全不会生效！**
+
+**完整错误传播链（定时调度路径）：**
+
+| 步骤 | 代码位置 | 动作 | 结果 |
+|------|----------|------|------|
+| 1 | [controller.ts L125](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/browser-management/controller.ts#L125) | `createRemoteBrowserForRun` 槽位不足 | `throw new Error('User has reached maximum browser limit')` |
+| 2 | [scheduler/index.ts L129-L137](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L129-L137) | 被 `createWorkflowAndStoreMetadata` catch | 返回 `{ success: false, error: message }`，**不重新抛出** |
+| 3 | [scheduler/index.ts L864-L865](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L864-L865) | `handleRunRecording` 解构返回值 | `browserId = undefined`, `runId = undefined` |
+| 4 | [scheduler/index.ts L867-L869](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L867-L869) | 检查 `runId` 有效性 | `throw new Error('runId or userId is undefined')` |
+| 5 | [scheduler/index.ts L903-L908](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L903-L908) | 被 `handleRunRecording` 自己的 catch 捕获 | 仅日志，**不重新抛出** |
+| 6 | [task-runner.ts L673](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/task-runner.ts#L673) | Graphile Worker 收到返回值 | 函数返回 `undefined`，Worker 认为任务**成功完成** |
+
+**核心问题**：两处 catch 都"吞掉"了错误，没有重新抛出给 Graphile Worker。
+
+```
+Graphile Worker
+      │
+      ▼ 调用
+handleRunRecording()
+      │
+      ├─ try {
+      │    createWorkflowAndStoreMetadata()
+      │      │
+      │      ├─ try {
+      │      │    createRemoteBrowserForRun() → 抛错
+      │      │  } catch (e) {
+      │      │    return { success: false }  ← 第1次吞错
+      │      │  }
+      │      ↓
+      │    runId = undefined → 抛错
+      │  } catch (error) {
+      │    logger.error(...)  ← 第2次吞错
+      │    // 没有 throw error！
+      │  }
+      ↓
+返回 undefined → Graphile Worker 标记为成功
+```
+
+**maxAttempts 何时才会生效？**
+
+只有当 `handleRunRecording` 抛出**未被捕获**的异常时，Graphile Worker 才会触发重试。例如：
+- `await handleRunRecording(...)` 抛出异常（但目前不会）
+- Worker 进程崩溃（不是应用层错误）
+- 数据库连接中断（不是业务逻辑错误）
+
+**即使修复了重新抛出，重试仍无意义**：
+
+即使我们在 `handleRunRecording` 的 catch 块末尾加上 `throw error`，让 Graphile Worker 触发重试，由于：
+- Graphile Worker 默认重试间隔是指数退避（1s, 2s, 4s, 8s, 16s, 32s...）
+- 浏览器槽位通常不会在几秒内释放（运行中的任务可能持续几分钟）
+- 6 次重试会在约 1 分钟内全部失败
+
+所以 `maxAttempts: 6` 本质上是一个**无效的重试机制**，无法解决浏览器槽位不足的排队问题。真正的解决方案应该是**将定时调度路径也纳入应用层排队（queued 状态）**。
 
 ### 1.3 应用层排队（Layer 2）
 
@@ -553,7 +608,7 @@ Cron 时间到达
       ↓
 schedule-worker 每 30 秒轮询
       ↓
-声明任务 + 加入 SCHEDULED_WORKFLOW 队列
+声明任务 + 加入 SCHEDULED_WORKFLOW 队列 (maxAttempts: 6)
       ↓
 Worker 消费 → 调用 handleRunRecording(scheduler版本)
       ↓
@@ -566,11 +621,19 @@ reserveBrowserSlotAtomic 成功?
     │              ↓
     │        readyForRunHandler → 执行工作流 → 完成/失败 → 销毁浏览器
     │
-    └─ 否 → throw Error → catch 返回 {success: false}
+    └─ 否 → ① throw Error('User has reached maximum browser limit')
                  ↓
-           handleRunRecording 拿不到 runId → 再次 throw
+           ② 被 createWorkflowAndStoreMetadata catch → return {success: false}
                  ↓
-           SCHEDULED_WORKFLOW 任务失败（Graphile Worker 按 maxAttempts: 6 重试）
+           ③ handleRunRecording 解构失败对象 → runId = undefined
+                 ↓
+           ④ throw new Error('runId or userId is undefined')
+                 ↓
+           ⑤ 被 handleRunRecording 自己的 catch 捕获 → 仅日志，不重新抛出
+                 ↓
+           ⑥ 函数静默返回 undefined → Graphile Worker 认为任务成功
+                 ↓
+           ⚠️  maxAttempts: 6 完全不会触发！任务永久丢失！
 ```
 
 #### 路径 C：API/SDK 运行（无应用层排队）
@@ -684,11 +747,15 @@ reserveBrowserSlotAtomic 成功?
 - **问题**：同名变量值不同，容易混淆
 - **建议**：重命名区分含义，如 `BROWSER_SESSION_INIT_TIMEOUT`（45s）和 `WORKER_BROWSER_READY_TIMEOUT`（60s）
 
-**缺陷 4：定时调度失败后重试机制不清晰**
+**缺陷 4：定时调度失败后 maxAttempts 完全不生效（任务永久丢失）**
 
-- **问题**：`SCHEDULED_WORKFLOW` 任务设置 `maxAttempts: 6`，但失败后只是 Graphile Worker 内部重试，不经过应用层排队检查浏览器槽位
-- **影响**：如果用户一直占满槽位，6 次重试可能全部失败，任务永久丢失
-- **建议**：重试间隔内检查槽位，或将失败任务转入应用层 queued 状态
+- **位置**：[scheduler/index.ts L903-L908](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L903-L908)
+- **问题**：`SCHEDULED_WORKFLOW` 任务设置 `maxAttempts: 6`，但两处 catch 都"吞掉"了错误（`createWorkflowAndStoreMetadata` catch 返回 `{success: false}` 不重新抛出，`handleRunRecording` catch 仅日志不重新抛出），函数最终返回 `undefined`，Graphile Worker 认为任务成功完成
+- **影响**：浏览器槽位不足时，定时调度任务**永久丢失**，没有重试，没有排队，甚至连失败日志都不会被 Graphile Worker 记录
+- **建议**：
+  1. 在 `handleRunRecording` 的 catch 块末尾添加 `throw error`，让 Graphile Worker 能感知到失败
+  2. 但即使修复了重新抛出，由于重试间隔太短（指数退避，约 1 分钟内 6 次重试全部失败），仍无法解决问题
+  3. **真正的修复**：将定时调度路径也纳入应用层排队（queued 状态），与 Web UI 路径保持一致
 
 ### 5.2 潜在风险
 
