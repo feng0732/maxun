@@ -635,33 +635,321 @@ while (!browser && (Date.now() - browserWaitStart) < BROWSER_INIT_TIMEOUT && pol
 
 ---
 
-## 8. 关键设计缺陷分析
+## 8. 深度专项分析
 
-### 8.1 无代理轮换 / IP 池机制
+### 8.1 SDK 更新代理字段的真实落点分析
+
+**核心发现：SDK 的代理更新功能是死代码，完全不生效。**
+
+**文件**: `server/src/api/sdk.ts`
+
+SDK 的 `PUT /api/sdk/robots/:id` 路由中，接收 `proxy_url`、`proxy_username`、`proxy_password` 参数并赋值给 `updateData`：
+
+```typescript
+if (updates.proxy_url !== undefined) {
+    updateData.proxy_url = updates.proxy_url;
+}
+if (updates.proxy_username !== undefined) {
+    updateData.proxy_username = updates.proxy_username;
+}
+if (updates.proxy_password !== undefined) {
+    updateData.proxy_password = updates.proxy_password;
+}
+
+await robot.update(updateData);
+```
+
+**但 Robot 模型中根本不存在这三个字段**：
+
+```typescript
+// server/src/models/Robot.ts — RobotAttributes 接口完整定义：
+interface RobotAttributes {
+  id: string;
+  userId?: number;
+  recording_meta: RobotMeta;
+  recording: RobotWorkflow;
+  google_sheet_email?: string | null;
+  google_sheet_name?: string | null;
+  google_sheet_id?: string | null;
+  google_access_token?: string | null;
+  google_refresh_token?: string | null;
+  airtable_base_id?: string | null;
+  airtable_base_name?: string | null;
+  airtable_table_name?: string | null;
+  airtable_access_token?: string | null;
+  airtable_refresh_token?: string | null;
+  schedule?: ScheduleConfig | null;
+  airtable_table_id?: string | null;
+  webhooks?: WebhookConfig[] | null;
+  // ❌ 没有 proxy_url / proxy_username / proxy_password
+}
+```
+
+**后果**：
+1. Sequelize 调用 `robot.update(updateData)` 时，三个代理字段会被**静默丢弃**
+2. 数据库的 Robot 表中不存在这些列，不会存储任何值
+3. 后续运行时，代理配置仍然从 **User 表** 读取，和 Robot 表完全无关
+4. 用户通过 SDK 以为自己给某个机器人配置了特定代理，但实际上**全局代理没变**
+
+**代码调用链验证**：
+- 所有代理读取都通过 `getDecryptedProxyConfig(userId)` — 传入的是 `userId`
+- 该函数从 `User.findByPk(userId)` 查询，**不使用任何 robotId**
+- 不存在 `getDecryptedProxyConfigForRobot(robotId)` 这类函数
+
+---
+
+### 8.2 文档类运行是否跳过浏览器代理
+
+**结论：文档类机器人 (doc-extract / doc-parse) 完全跳过浏览器，也完全不应用代理。**
+
+**文件**: `server/src/task-runner.ts`
+
+在任务执行入口 `processRunExecution()` 中，有两个提前 return 的分支：
+
+```typescript
+// L155-L165: doc-extract 类型直接 return
+if ((plainRun.interpreterSettings as any)?.robotType === 'doc-extract') {
+    logger.log('info', `Run ${data.runId} is a document robot — skipping browser, running document extraction`);
+    const recording = await Robot.findOne({ where: { 'recording_meta.id': plainRun.robotMetaId }, raw: true });
+    // ...
+    const { executeDocumentRun } = await import('./utils/document/executeDocumentRun');
+    await executeDocumentRun(recording, run, data.userId, serverIo);
+    return;  // ✅ 提前返回，不走到浏览器逻辑
+}
+
+// L168-L178: doc-parse 类型直接 return
+if ((plainRun.interpreterSettings as any)?.robotType === 'doc-parse') {
+    logger.log('info', `Run ${data.runId} is a document-parse robot — skipping browser, running document parsing`);
+    // ...
+    const { executeDocumentParseRun } = await import('./utils/document/executeDocumentParseRun');
+    await executeDocumentParseRun(recording, run, data.userId, serverIo);
+    return;  // ✅ 提前返回，不走到浏览器逻辑
+}
+```
+
+**完整跳过路径**：
+
+```
+processRunExecution()
+    ├─ doc-extract → executeDocumentRun() → return ❌ 无浏览器无代理
+    ├─ doc-parse → executeDocumentParseRun() → return ❌ 无浏览器无代理
+    └─ 其他类型 → browserPool.getRemoteBrowser() → ✅ 有浏览器有代理
+```
+
+**注意事项**：
+- 虽然文档机器人不创建浏览器，但它们仍然会被 `QUEUE_NAMES.EXECUTE_RUN` 任务队列处理，`maxAttempts: 1`
+- 文档机器人的运行记录仍然会通过 `recoverOrphanedRuns()` 进行崩溃恢复
+- 如果文档机器人处理的是需要联网的文档（例如通过 URL 拉取 PDF），**这些网络请求不受代理控制**，直接走宿主机默认网络
+
+---
+
+### 8.3 任务队列重试与运行重试的边界分析
+
+系统存在两套独立的重试机制，分别位于不同层级，用途不同，边界清晰：
+
+#### 8.3.1 层级一：Graphile Worker 任务队列重试
+
+**位置**: `server/src/storage/graphileWorker.ts` + 各 `addJob()` 调用点
+
+**作用域**: 整个任务执行函数，用于基础设施级故障（DB 宕机、进程崩溃）
+
+**配置方式**: 调用 `addJob()` 时传入 `{ maxAttempts: N }`
+
+| 任务类型 | 队列名 | maxAttempts | 说明 |
+|---------|--------|-------------|------|
+| 调度触发工作流 | `SCHEDULED_WORKFLOW` | 6 | schedule-worker.ts 中入队 |
+| 直接执行运行 | `EXECUTE_RUN` | 1 | 所有直接运行场景 |
+| 文档运行(直接触发) | `EXECUTE_RUN` | 1 | scheduler/index.ts, storage.ts, record.ts |
+
+**EXECUTE_RUN 的 maxAttempts 统一为 1** 的证据：
+
+```typescript
+// scheduler/index.ts L116: 文档机器人
+await addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 });
+
+// storage.ts L1069: 手动运行
+const jobId = await addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 });
+
+// storage.ts L1539: processQueuedRuns 重排队
+const jobId = await addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 });
+
+// record.ts L632: API 运行
+await addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 });
+```
+
+**触发条件**:
+- 任务执行函数抛出未捕获异常
+- Worker 进程在任务执行中崩溃
+- Worker 与 PostgreSQL 连接中断后恢复
+
+#### 8.3.2 层级二：运行级别重试 (run.retryCount)
+
+**位置**: `server/src/workflow-management/scheduler/index.ts` L216-L246
+
+**作用域**: 单个 Run 记录，用于业务级故障（浏览器初始化失败、目标网站访问失败）
+
+**配置方式**: 硬编码上限为 3，写在调度逻辑里
+
+**触发时机 — 在 `createWorkflowAndStoreMetadata()` 中调用执行前检查**：
+
+```typescript
+const retryCount = plainRun.retryCount || 0;
+if (retryCount >= 3) {
+    // 直接标记为永久失败
+    await run.update({ status: 'failed', log: 'Max retries exceeded (3/3)' });
+    return { success: false, error: 'Max retries exceeded' };
+}
+```
+
+**状态流转路径**：
+
+```
+第一次执行:
+  创建 Run → status='scheduled' → retryCount=0
+    → createWorkflowAndStoreMetadata()
+      → 成功: completed
+      → 失败: 检查 retryCount < 3 → status='queued', retryCount=1
+
+processQueuedRuns() 每5秒轮询:
+  找到 queued Run → createRemoteBrowserForRun() → status='running'
+    → addJob(EXECUTE_RUN)
+      → 成功: completed
+      → 失败: 被 catch 住 → status='queued', retryCount=2
+
+再次轮询:
+  同上，retryCount++ 直到 =3
+    → 下次进入时直接标记 failed
+```
+
+#### 8.3.3 边界总结
+
+| 维度 | 任务队列重试 (maxAttempts) | 运行级别重试 (retryCount) |
+|------|---------------------------|--------------------------|
+| **计数器存储** | Graphile Worker jobs 表 (PostgreSQL) | 业务 Run 表 |
+| **重试对象** | 任务处理函数整体 | 单个 Run 记录 |
+| **上限配置** | addJob 参数指定 (1~6) | 硬编码 3 |
+| **触发动作** | Worker 重跑同一个 payload | Run 状态改为 queued，重新走创建浏览器流程 |
+| **是否新建浏览器** | 否，用 payload 里的 browserId 找现有浏览器 | 是，调用 createRemoteBrowserForRun() 重新创建 |
+| **是否重新应用代理** | 否，浏览器 context 已创建 | 是，新建浏览器时重新从 User 表取代理 |
+| **失败来源** | 进程崩溃、DB 故障等基础设施故障 | 浏览器崩溃、目标站点访问失败等业务故障 |
+| **代理变更机会** | ❌ 无 | ⚠️ 有，但始终取同一个 User 的代理 |
+
+---
+
+### 8.4 浏览器服务连接重试与目标代理应用的层级区别
+
+这是两个**完全独立**的层级，不要混淆：
+
+#### 8.4.1 层级 A：浏览器服务连接（与代理无关）
+
+**文件**: `server/src/browser-management/browserConnection.ts`
+
+**职责**: 建立 Node.js 进程到 Playwright 浏览器引擎（远程 WebSocket 或本地进程）的**控制连接**
+
+```
+Node.js (服务端)
+   │
+   │  L1 连接：chromium.connect(wsEndpoint)
+   │         或 chromium.launch() 本地启动
+   ▼
+Playwright Browser 对象
+   │
+   │  L2 应用：browser.newContext({ proxy: ... })
+   ▼
+BrowserContext + 代理配置
+   │
+   ▼
+访问目标网站（通过代理）
+```
+
+**L1 连接重试参数**（`CONNECTION_CONFIG`）：
+
+```typescript
+{
+    maxRetries: 3,           // 最多 3 次连接尝试
+    retryDelay: 2000,        // 每次重试间隔 2 秒
+    connectionTimeout: 30000 // 单次连接超时 30 秒
+}
+```
+
+**L1 连接失败的典型原因**：
+- 远程浏览器 Docker 容器未启动（健康检查 `http://localhost:3002/health` 不通）
+- WebSocket 端口被防火墙拦截
+- 浏览器服务资源耗尽，无法接受新连接
+- Playwright 版本不兼容导致 `chromium.connect()` 握手失败
+
+**L1 回退路径**: 3 次远程连接失败后，自动调用 `launchLocalBrowser()` 本地启动 Chromium
+
+#### 8.4.2 层级 B：目标代理应用（L1 成功之后才会执行）
+
+**文件**: `server/src/browser-management/classes/RemoteBrowser.ts` L483-L518
+
+**职责**: 告诉已经连接好的浏览器引擎："**当你访问外部网站时，请通过这个代理服务器**"
+
+**触发顺序**:
+
+```
+connectToRemoteBrowser()    ← L1 成功，拿到 Browser 对象
+    ↓
+getDecryptedProxyConfig()   ← 从 User 表解密代理配置
+    ↓
+构建 contextOptions.proxy   ← 组装代理参数
+    ↓
+browser.newContext({ proxy: { server, username, password } })  ← 真正生效
+```
+
+**L2 代理失败的典型原因**：
+- 代理服务器 IP / 端口错误
+- 代理用户名 / 密码认证失败
+- 代理协议不匹配（要求 SOCKS5 却给了 HTTP）
+- 代理服务器本身宕机或带宽耗尽
+- 目标网站封禁了该代理的出口 IP
+
+**L2 重试机制**:
+- RemoteBrowser.initialize() 内 3 次重试
+- 但每一次重试都调用 `getDecryptedProxyConfig(userId)` — 同一个用户，同一个代理
+- 3 次全部失败后抛异常，外层运行重试可能再次创建浏览器（但代理依然相同）
+
+#### 8.4.3 层级影响矩阵
+
+| 故障场景 | L1 连接层 | L2 代理层 | 是否回退本地浏览器 | 运行重试是否可能成功 |
+|---------|----------|----------|-------------------|--------------------|
+| 远程浏览器服务宕机 | ❌ 失败 | 不执行 | ✅ 自动回退本地 | ⚠️ 取决于本地能否启动 Chromium |
+| 代理服务器宕机 | ✅ 正常 | ❌ 失败 | ❌ 本地浏览器也用同一个代理 | ❌ 所有重试都用同一个坏代理 |
+| 代理认证失败 | ✅ 正常 | ❌ 失败 | ❌ 同上 | ❌ 同上 |
+| 目标网站封禁代理IP | ✅ 正常 | ✅ 上下文创建成功 | ❌ 上下文已创建 | ❌ 同上，出口 IP 没变 |
+| Docker 网络中断 | ❌ 失败 | 不执行 | ✅ 回退本地（本地网络可能通） | ⚠️ 本地回退成功就可能成功 |
+| Playwright 版本冲突 | ❌ 失败 | 不执行 | ✅ 回退本地（同版本二进制） | ⚠️ 取决于本地二进制 |
+
+---
+
+## 9. 关键设计缺陷分析
+
+### 9.1 无代理轮换 / IP 池机制
 
 - **问题**：每个用户只能配置一个代理，没有多代理池
 - **影响**：无法实现 IP 轮换，容易被目标网站封禁
 - **代码证据**：User 模型只有单组代理字段，没有 Proxy 或 ProxyPool 表
 
-### 8.2 无运行时代理切换
+### 9.2 无运行时代理切换
 
 - **问题**：代理仅在 BrowserContext 创建时应用，运行中无法切换
 - **影响**：遇到代理失败时只能重试同一个代理，无法自动切换到备用代理
 - **代码证据**：`RemoteBrowser` 没有提供 `changeProxy()` 方法
 
-### 8.3 所有重试都不切换代理
+### 9.3 所有重试都不切换代理
 
 - **问题**：四级重试机制（连接重试、初始化重试、运行重试、任务队列重试）都使用同一个代理
 - **影响**：代理本身故障时，重试多少次都不会成功
 - **代码证据**：`getDecryptedProxyConfig(userId)` 始终返回同一个配置
 
-### 8.4 本地回退后代理失效问题
+### 9.4 本地回退后代理失效问题
 
 - **问题**：远程浏览器连接失败回退到本地浏览器时，代理配置依然会应用
 - **但**：如果是代理本身导致的问题，本地浏览器也会同样失败
 - **注意**：本地浏览器启动参数里没有 `--proxy-server` 参数，代理是通过 Playwright 的 `context.proxy` 配置的
 
-### 8.5 代理测试接口名不副实
+### 9.5 代理测试接口名不副实
 
 - **问题**：测试接口 `/api/proxy/test` 实际上没有使用代理进行测试
 - **代码证据**：
@@ -673,24 +961,29 @@ while (!browser && (Date.now() - browserWaitStart) < BROWSER_INIT_TIMEOUT && pol
   await browser.close();
   ```
 
-### 8.6 SDK 更新代理但不立即生效
+### 9.6 SDK 代理更新是死代码（详细原理见 8.1 节）
+
+- **问题**：SDK 的 `PUT /api/sdk/robots/:id` 虽然接收 `proxy_url` 等参数并赋值给 `updateData`，但 Robot 模型根本没有这些字段
+- **影响**：Sequelize 静默丢弃这些值，数据库不存储，运行时也不读取。调用方以为给某个机器人设置了专属代理，实际全局代理没变
+- **代码证据**：`RobotAttributes` 接口无代理字段，`getDecryptedProxyConfig()` 只查 User 表
+
+### 9.7 SDK 用户级代理更新不立即生效
 
 **文件**: `server/src/api/sdk.ts`
 
-SDK 允许更新用户代理配置，但如果有正在运行的浏览器，不会立即生效。
-新创建的浏览器才会使用新的代理配置。
+即使代理字段是正确写到 User 表（修复 SDK bug 之后），但正在运行的浏览器已经初始化完毕，代理配置已固化在 BrowserContext 里。只有**下次重新创建浏览器**时才会应用新的代理配置。
 
 ---
 
-## 9. 改进建议
+## 10. 改进建议
 
-### 9.1 实现真正的代理池
+### 10.1 实现真正的代理池
 
-1. 新建 `Proxy` 模型表，支持多代理配置
-2. 增加 `ProxyPool` 管理类，实现轮换策略（轮询、随机、最少使用）
-3. 每次创建浏览器时从池中选择一个可用代理
+1. 新建 `Proxy` 模型表，支持多代理配置（每个用户可配置 N 个代理）
+2. 增加 `ProxyPool` 管理类，实现轮换策略（轮询、随机、最少使用、健康过滤）
+3. 每次创建浏览器时从池中选择一个**健康可用**的代理
 
-### 9.2 增加运行时代理切换能力
+### 10.2 增加运行时代理切换能力
 
 在 `RemoteBrowser` 中增加方法：
 
@@ -703,7 +996,7 @@ public async switchProxy(newProxyConfig: ProxyConfig): Promise<void> {
 }
 ```
 
-### 9.3 失败时自动切换代理
+### 10.3 失败时自动切换代理
 
 修改重试逻辑，代理失败时从池中选择下一个代理：
 
@@ -721,7 +1014,7 @@ while (!success && retryCount < MAX_RETRIES) {
 }
 ```
 
-### 9.4 修复代理测试接口
+### 10.4 修复代理测试接口
 
 ```typescript
 // 修复后的测试逻辑
@@ -730,13 +1023,13 @@ const page = await context.newPage();
 await page.goto('https://example.com');
 ```
 
-### 9.5 本地回退时考虑代理因素
+### 10.5 本地回退时考虑代理因素
 
-如果连接失败时，判断是否是代理导致的问题，如果是可以尝试下一个代理而不是直接回退到本地。
+如果 L2 代理层失败，先尝试下一个代理而不是直接回退到本地浏览器；如果是 L1 连接层失败，再考虑本地回退。
 
 ---
 
-## 10. 相关文件清单
+## 11. 相关文件清单
 
 | 文件路径 | 职责 |
 |----------|------|
