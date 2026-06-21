@@ -121,23 +121,33 @@ Interpreter.run(page, params)
         runLoop() 主循环 (while true)
               │
               ├─ [1] 中止检查: isAborted / page.isClosed() / stopper
-              ├─ [2] 防死循环: MAX_LOOP_ITERATIONS = 1000
-              ├─ [3] waitForLoadState() 等待页面稳定
+              ├─ [2] 防死循环: ++loopIterations > MAX_LOOP_ITERATIONS(1000) → return
+              ├─ [3] 入口 waitForLoadState() 失败 → 关闭页面 + return
               ├─ [4] workflowCopy 为空则结束
               │
-              ├─ [5] 匹配动作 (当前简化为取最后一个)
+              ├─ [5] 匹配动作 (取最后一个)
               │     actionId = workflowCopy.length - 1
               │
-              ├─ [6] 重复检查: repeatCount > maxRepeats 则 throw Error
-              │     └─ (repeatCount 累加的前提是 action === lastAction)
+              ├─ [6] 重复检查: action === lastAction ? repeatCount++ : 0
+              │     └─ repeatCount > maxRepeats → throw Error 终止
               │
-              ├─ [7] 执行动作: carryOutSteps(page, action.what)
-              │     │
-              │     ├─ 成功: usedActions.push() → workflowCopy.splice() → loopIterations=0
-              │     └─ 失败: catch 后记录日志 → continue 下一轮循环 (动作不移除)
-              │
-              └─ [8] (回到循环顶部)
+              └─ [7] try { carryOutSteps() } catch { continue }
+                    │
+                    ├─ ✅ 成功路径:
+                    │   ├─ usedActions.push(action.id)
+                    │   ├─ workflowCopy.splice(actionId, 1)  ← 整组移除
+                    │   ├─ executedActions++ / progressUpdate
+                    │   └─ loopIterations = 0  ← 死循环计数器归零
+                    │
+                    └─ ❌ 失败路径:
+                        ├─ log error
+                        └─ continue → 回到 while 顶部 (整组不移除，下轮重试)
 ```
+
+**关键不变量**：
+- 整组 `WhereWhatPair` 被移除 ⟺ `carryOutSteps()` 正常返回
+- `loopIterations` 归零 ⟺ 有一组动作被成功移除
+- `repeatCount` 累加 ⟺ 同一组动作连续被匹配（未被移除）
 
 #### 关键机制说明：
 
@@ -281,113 +291,194 @@ While 队列非空 && 结果数 < limit:
 
 ---
 
-### 3.4 Playwright 原生动作优化
+### 3.4 Playwright 原生动作的失败处理语义
 
-部分原生动作有特殊优化处理：
+每个原生动作的失败行为各不相同，以下严格对照代码事实说明：
 
-#### (1) `goto` 导航优化
-```typescript
-// 根据后续动作自动选择等待策略
-const needsDataSoon = this.blockNeedsVisualRender(steps) 
-  || this.remainingWorkflowNeedsVisualRender(remaining);
-existingOpts.waitUntil = needsDataSoon ? 'networkidle' : 'domcontentloaded';
-```
-失败处理：try-catch 吞掉异常，仅记录 WARN 日志，**继续执行后续动作**。
+#### (1) `goto` 导航
+- **优化**：默认降级为 `domcontentloaded` 等待策略（根据后续动作决定是否追加动态稳定等待）
+- **失败处理**：try-catch 完整包裹，**吞掉异常**，仅记录 WARN 日志
+- **推进语义**：当前 step 视为"执行过"，继续同 Pair 内的下一个 step
+- **整组影响**：**不**导致整组动作失败，只要后续 step 都完成，整组正常移除
 
-#### (2) `click` 失败重试
-```typescript
-try {
-  await page.click(selector);
-} catch {
-  try {
-    // 重试：使用 force: true 跳过可操作性检查
-    await page.click(selector, { force: true });
-  } catch {
-    // 两次都失败：continue 跳到下一个 step
-    continue;
-  }
-}
-```
+#### (2) `click` 点击
+- **重试策略**：第1次失败 → 用 `force: true` 跳过可操作性检查再试一次
+- **最终失败**：两次尝试都失败 → `continue` 跳过当前 step
+- **推进语义**：当前 step 跳过，继续同 Pair 内的下一个 step
+- **整组影响**：**不**导致整组动作失败
 
-#### (3) `waitForLoadState` 降级
-请求 `networkidle` 但超时时自动降级为 `domcontentloaded`。降级后也失败则不抛异常。
-
-#### (4) 其他通用原生动作
 ```typescript
 try {
   await executeAction(invokee, methodName, step.args);
 } catch (error: any) {
-  this.log(`Action ${methodName} failed: ${error.message}`, Level.ERROR);
-  continue;  // 跳到下一个 step，不抛错
+  try {
+    await executeAction(invokee, methodName, [clickArgs[0], { force: true }]);
+  } catch (error: any) {
+    this.log(`Click action failed: ${error.message}`, Level.WARN);
+    continue;  // 跳到 for 循环的下一个 step
+  }
 }
 ```
+
+#### (3) `waitForLoadState` 页面加载等待
+- **降级策略**：请求 `networkidle`/`load` 时自动降级为 `domcontentloaded` 再尝试
+- **关键细节**：catch 块内的降级重试 **没有再套 try-catch**
+- **推进语义**：
+  - 第一次失败 → 降级后重试
+  - 降级后也失败 → **异常向上抛出**，终止 carryOutSteps
+- **整组影响**：降级后再失败会冒泡到 runLoop，整组动作**不会被移除**，下一轮循环重试整组
+
+```typescript
+try {
+  // 第一次尝试（已降级为 domcontentloaded）
+  await executeAction(invokee, methodName, args);
+} catch (error: any) {
+  // catch 块内没有再 try-catch！
+  await executeAction(invokee, methodName, ['domcontentloaded', { timeout: 10000 }]);
+  // 上面这句如果也失败，异常直接抛出 carryOutSteps
+}
+```
+
+#### (4) 其他通用原生动作（type/fill/...）
+- **失败处理**：try-catch 包裹 + `continue`
+- **推进语义**：当前 step 跳过，继续同 Pair 内的下一个 step
+- **整组影响**：**不**导致整组动作失败
+
+#### 小结：原生动作失败与整组移除的关系
+
+| 动作 | 失败后是否抛异常 | 当前 step 处理 | 同 Pair 后续 step | 整组何时被移除 |
+|------|----------------|-------------|----------------|-------------|
+| goto | 否（吞掉） | 跳过 | 继续执行 | 正常移除 |
+| click | 否（最终 continue） | 跳过 | 继续执行 | 正常移除 |
+| waitForLoadState | **是（降级后再失败时）** | 终止 carryOutSteps | 不再执行 | **整组不移除，下轮重试** |
+| 其他原生动作 | 否（continue） | 跳过 | 继续执行 | 正常移除 |
+| 自定义 wawActions | **是** | 终止 carryOutSteps | 不再执行 | **整组不移除，下轮重试** |
+
+> **整组动作（WhereWhatPair）被移除的唯一条件**：`carryOutSteps()` 正常 return（没有抛出异常），此时 runLoop 会执行 `workflowCopy.splice(actionId, 1)`。
 
 ---
 
 ## 四、失败处理链路（对照代码事实）
 
-### 4.1 单个动作失败后的处理路径（核心）
+### 4.1 单步失败 vs 整组移除：核心推进语义
 
-这是最容易误解的部分，以下是严格对照代码事实的描述：
+这是最容易误解的部分。关键要区分两个层次：
+1. **step 层**：单个动作（`what[]` 数组中的一项）
+2. **pair 层**：整组动作（一个 `WhereWhatPair`，含多个 step）
 
 ```
-carryOutSteps() 遍历 steps[] 中的每个 step:
+runLoop 主循环 (while true)
     │
-    ├─ 动作分类
-    │   ├─ Playwright 原生动作 (goto/click/wait/其他):
-    │   │   ├─ goto/waitForLoadState: 内部 try-catch 吞掉 → 继续下一个 step
-    │   │   ├─ click: 第1次失败 → force:true 重试 → 再失败 → continue 下一个 step
-    │   │   └─ 其他原生动作: 失败 → continue 下一个 step
-    │   │
-    │   └─ 自定义 wawActions (scrape/scrapeList/scrapeSchema/...):
-    │       └─ 无内部 try-catch → 失败直接抛出异常
-    │          │
-    │          └─ 异常冒泡到 runLoop() 的外层 try-catch
+    ├─ 入口 waitForLoadState() 失败 → 关闭页面 + return（整个 runLoop 结束）
     │
-    ▼
-runLoop() 外层 catch (L2861-L2864):
-    ├─ this.log(e, Level.ERROR)   // 记录错误日志
-    └─ continue                   // 直接进入下一轮 while 循环
-         │
-         ▼
-    下一轮循环发生了什么？
-    ├─ [动作不移除] workflowCopy.splice(actionId, 1) 未被执行
-    │   → 同一个 WhereWhatPair 仍留在 workflowCopy 中
+    ├─ 匹配 actionId = workflowCopy.length - 1
+    ├─ repeatCount 检查（同动作反复执行超限则 throw）
     │
-    ├─ [匹配同一动作] actionId = workflowCopy.length - 1
-    │   → 仍然匹配到同一个失败的动作
-    │
-    ├─ [repeatCount 累加] action === lastAction → repeatCount++
-    │   → 因为同一个动作对象反复被匹配
-    │
-    ├─ [loopIterations 累加] 成功时才会 reset loopIterations=0
-    │   → 失败时不 reset，持续 +1
-    │
-    └─ [两种可能的结局]
-        ├─ 结局 A: repeatCount > maxRepeats
-        │   → throw new Error(`Action xxx exceeded max retries`)
-        │   → 整个 runLoop 终止 → 异常继续向上冒泡
-        │
-        └─ 结局 B: loopIterations > MAX_LOOP_ITERATIONS (1000)
-            → 直接 return，静默终止 runLoop
+    └─ try {
+         carryOutSteps(page, action.what)  ← 执行整组 step
+         usedActions.push(...)              ← 标记为已用
+         workflowCopy.splice(actionId, 1)   ← ★ 整组从队列移除 ★
+         loopIterations = 0                 ← 死循环计数器归零
+       } catch (e) {
+         log(e)                             ← 记录错误
+         continue                           ← 进入下一轮循环
+       }
 ```
 
-**结论（对照代码事实）：**
-
-| 问题 | 答案 | 代码依据 |
-|------|------|---------|
-| 单个 WhereWhatPair 内某个 step 失败，会不会移除当前动作？ | **原生动作（goto/click等）失败：不会移除，继续同 Pair 内下一个 step**<br>**自定义动作（scrape/scrapeList等）失败：整个 Pair 都不会被移除** | `carryOutSteps` 内 `continue` 跳到下一个 step；`runLoop` 内 catch 后 `continue`，不执行 `splice` |
-| 会不会反复重试同一个动作？ | **会**，但不是无限重试。自定义动作反复失败会触发 `maxRepeats` 保护或 `MAX_LOOP_ITERATIONS` 死循环保护 | `runLoop` L2814-L2824（maxRepeats）、L2737-L2741（1000次保护） |
-| 重试是"原地重试"还是"进入下一轮循环"？ | **进入下一轮 while 循环**。不是在当前 try 块内 retry，而是走完整的循环流程（包括 waitForLoadState、匹配动作等） | `runLoop` L2864 `continue` 语句 |
-| 单个 step 失败会不会终止整个工作流？ | **一般不会**，除非：① 触发 maxRepeats 超限 ② 触发 MAX_LOOP_ITERATIONS ③ 用户中止 ④ 顶层（如 browser.init）抛出致命错误 | 见五层异常捕获体系 |
+**整组被移除的唯一条件**：`carryOutSteps()` 正常 return（没有抛出异常）。
 
 ---
 
-### 4.2 五层异常捕获体系
+### 4.2 carryOutSteps 内部：step 失败的五种命运
+
+`carryOutSteps()` 用 `for (const step of steps)` 顺序执行每个 step，不同动作失败后的行为差异很大：
+
+```
+for (const step of steps) {
+    │
+    ├─ 分支 A: 是自定义 wawActions (scrape/scrapeList/...)
+    │   │
+    │   └─ 直接 await wawActions[...]()
+    │      │
+    │      ├─ 成功 → 继续下一个 step
+    │      └─ 失败 → 异常直接抛出 → 终止 carryOutSteps → 回到 runLoop 的 catch
+    │
+    └─ 分支 B: 是 Playwright 原生动作 (page.xxx)
+        │
+        ├─ (B1) goto
+        │   └─ try { ... } catch { 只 log 不抛 } → 继续下一个 step
+        │
+        ├─ (B2) waitForLoadState
+        │   └─ try {
+        │          第一次尝试（已降级为 domcontentloaded）
+        │        } catch {
+        │          再试一次 domcontentloaded  ← 没有再套 try-catch！
+        │          第二次失败 → 异常抛出 → 终止 carryOutSteps
+        │        }
+        │
+        ├─ (B3) click
+        │   └─ try {
+        │          第一次 click
+        │        } catch {
+        │          try { force:true 重试 } catch { continue → 下一个 step }
+        │        }
+        │
+        └─ (B4) 其他原生动作 (type/fill/...)
+            └─ try { ... } catch { continue → 下一个 step }
+```
+
+#### 失败命运对照表（严格对照代码事实）
+
+| 动作类型 | 失败后是否抛异常 | 当前 step | 同 Pair 后续 step | 整组是否移除 | 最终结局 |
+|---------|----------------|---------|----------------|------------|---------|
+| 自定义 wawActions | **是** | 终止 | 不再执行 | **否** | 下一轮循环整组重试 |
+| waitForLoadState（降级后再失败） | **是** | 终止 | 不再执行 | **否** | 下一轮循环整组重试 |
+| goto | 否（吞掉） | 跳过 | 继续执行 | 是 | 整组正常完成 |
+| click（两次都失败） | 否（continue） | 跳过 | 继续执行 | 是 | 整组正常完成 |
+| 其他原生动作 | 否（continue） | 跳过 | 继续执行 | 是 | 整组正常完成 |
+
+---
+
+### 4.3 整组重试的终止条件（maxRepeats + 死循环保护）
+
+当整组动作反复失败（如自定义动作或 waitForLoadState 持续失败）时，`runLoop` 会一轮接一轮地重试。但有两个保护机制会最终终止：
+
+#### 保护机制 1：maxRepeats 最大重复次数
+
+```typescript
+repeatCount = action === lastAction ? repeatCount + 1 : 0;
+if (this.options.maxRepeats && repeatCount > this.options.maxRepeats) {
+  throw new Error(`Action ${failedAction} exceeded max retries (${maxRepeats})`);
+}
+```
+
+- **触发条件**：同一个 `WhereWhatPair` 对象被连续匹配 `maxRepeats + 1` 次
+- **动作比较**：`action === lastAction` 是对象引用比较（因为动作对象未被 splice，所以引用相同）
+- **后果**：抛出 Error → 终止 runLoop → 异常冒泡到顶层 → Run 标记为 failed
+
+#### 保护机制 2：MAX_LOOP_ITERATIONS 死循环保护
+
+```typescript
+if (++loopIterations > MAX_LOOP_ITERATIONS) {  // MAX_LOOP_ITERATIONS = 1000
+  this.log('Maximum loop iterations reached, terminating to prevent infinite loop', Level.ERROR);
+  cleanup();
+  return;  // 静默返回，不抛异常
+}
+```
+
+- **触发条件**：while 循环累计超过 1000 次
+- **重置时机**：**只有**整组成功执行并 splice 后，才会 `loopIterations = 0`
+- **后果**：直接 return，runLoop 静默结束，**不抛异常**
+
+> 注意：即使所有 step 都"跳过式成功"（如全部是 goto/click 失败但被吞掉），只要 carryOutSteps 正常 return，整组就会被移除，loopIterations 也会归零，不会触发死循环保护。
+
+---
+
+### 4.4 五层异常捕获体系
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Layer 1: server/src/task-runner.ts 顶层 try-catch (L136)     │
+│ Layer 1: server/src/task-runner.ts 顶层 try-catch             │
 │   - 捕获所有未被下层吞掉的异常                                 │
 │   - 更新 Run.status = 'failed'                                │
 │   - 发送失败 webhook / socket 通知                            │
@@ -397,8 +488,8 @@ runLoop() 外层 catch (L2861-L2864):
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ Layer 2: server/src/workflow-management/classes/Interpreter.ts│
-│   - serializableCallback: try-catch 吞掉异常 (L705-L707)      │
-│   - binaryCallback: try-catch 吞掉异常 (L731-L733)            │
+│   - serializableCallback: try-catch 吞掉异常                  │
+│   - binaryCallback: try-catch 吞掉异常                        │
 │   - flushPersistenceBuffer: 指数退避重试 (最多3次)             │
 │   - InterpretRecording() 本身无 try-catch                     │
 │     → interpreter.run() 抛出的异常直接向上冒泡                │
@@ -406,20 +497,20 @@ runLoop() 外层 catch (L2861-L2864):
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ Layer 3: maxun-core/src/interpret.ts runLoop() 外层 try-catch │
-│   - 包裹 carryOutSteps() 调用 (L2832-L2865)                   │
+│   - 包裹 carryOutSteps() 调用                                 │
 │   - catch 后只记录日志 + continue，不抛出                      │
-│   - 但 maxRepeats 超限时会主动 throw Error (L2823)            │
+│   - 但 maxRepeats 超限时会主动 throw Error                    │
 │   - MAX_LOOP_ITERATIONS 超限时直接 return 不抛                │
-│   - waitForLoadState() 失败: 关闭页面 + return (L2750-L2756)  │
+│   - 循环入口 waitForLoadState() 失败: 关闭页面 + return       │
 └──────────────────────┬───────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ Layer 4: carryOutSteps() 每个 step 的 try-catch               │
-│   - goto/waitForLoadState: 内部 try-catch 降级 + 吞掉         │
-│   - click: 失败 → force:true 重试 → 再失败 continue           │
+│   - goto: 吞掉 → 继续下一个 step                              │
+│   - waitForLoadState: 先降级重试 → 再失败则向上抛              │
+│   - click: force:true 重试 → 再失败 continue                 │
 │   - 其他原生动作: 失败 → continue 下一个 step                  │
-│   - 自定义 wawActions: **无内部 try-catch**                   │
-│     → 失败直接抛出到 Layer 3                                  │
+│   - 自定义 wawActions: 无内部 try-catch → 直接抛出             │
 └──────────────────────┬───────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
@@ -428,13 +519,13 @@ runLoop() 外层 catch (L2861-L2864):
 │     → 分页选择器失败: 3次重试后剔除该选择器，不抛错            │
 │     → 分页点击操作: 3次重试后放弃本页，不抛错                  │
 │   - scrapeList/crawl/search: 单条记录失败不终止整体抓取        │
-│   - enqueueLinks: 单个新页面失败 try-catch 吞掉 (L619-L624)   │
+│   - enqueueLinks: 单个新页面失败 try-catch 吞掉                │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### 4.3 超时控制
+### 4.5 超时控制
 
 | 阶段 | 超时值 | 位置 |
 |------|--------|------|
@@ -451,7 +542,7 @@ runLoop() 外层 catch (L2861-L2864):
 
 ---
 
-### 4.4 用户中止流程
+### 4.6 用户中止流程
 
 ```
 用户点击停止 / abort API
@@ -477,7 +568,7 @@ abortRun(runId, userId)
 
 ---
 
-### 4.5 持久化重试机制
+### 4.7 持久化重试机制
 
 WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 `server/src/workflow-management/classes/Interpreter.ts`）：
 
@@ -501,7 +592,7 @@ WorkflowInterpreter 中实现了 **批量持久化 + 指数退避重试**（见 
 
 ---
 
-### 4.6 日志与调试通道
+### 4.8 日志与调试通道
 
 通过 `debugChannel` 回调接口，maxun-core 将内部状态推送给上层：
 
