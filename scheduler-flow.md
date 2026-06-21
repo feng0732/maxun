@@ -12,6 +12,10 @@
 |--------|-------------------|------------------|--------------------|-------------|------------|
 | ① **Cron 定时** | `SCHEDULED_WORKFLOW` → `scheduler/handleRunRecording()` → socket → `scheduler/executeRun()` | `SCHEDULED_WORKFLOW` → `createWorkflow` 内直接二次入队 `EXECUTE_RUN` → `processRunExecution()` **（无 socket）** | ✅ 走队列（`SCHEDULED_WORKFLOW`，重试 6 次） | `scheduled` | `runByScheduleId` |
 | ② **前端手动** | 直接入队 `EXECUTE_RUN` → `processRunExecution()` | 同左 | ✅ 走队列（`EXECUTE_RUN`，不重试） | `running` / `queued` | 无 |
+| &nbsp;&nbsp;②a `PUT /storage/runs/:id`（普通手动） | 有浏览器槽直接入队，无槽排队 | - | ✅ `EXECUTE_RUN` | `running` / `queued` | - |
+| &nbsp;&nbsp;②b `POST /storage/runs/run/:id`（重跑复用） | 复用已有 Run 记录，重新入队执行 | 同左 | ✅ `EXECUTE_RUN` | 复用原状态（执行中更新为 running） | - |
+| &nbsp;&nbsp;②c `POST /storage/runs/document-run/:id`（文档抽取） | - | 创建新 Run，直接入队 | ✅ `EXECUTE_RUN` | `running` | - |
+| &nbsp;&nbsp;②d `POST /storage/runs/document-parse-run/:id`（文档解析） | - | 创建新 Run，直接入队 | ✅ `EXECUTE_RUN` | `running` | - |
 | ③ **REST API** | **不走队列**，socket 直调 → `api/executeRun()` | 入队 `EXECUTE_RUN` → `processRunExecution()` | 非文档❌；文档✅（`EXECUTE_RUN`） | `running` | `runByAPI` |
 | ④ **SDK / CLI** | **不走队列**，socket 直调 → `api/executeRun()` | 入队 `EXECUTE_RUN` → `processRunExecution()` | 非文档❌；文档✅（`EXECUTE_RUN`） | `running` | `runBySDK` / `runByCLI` |
 | ⑤ **MCP Worker** | **不走队列**，socket 直调 → `api/executeRun()` | 入队 `EXECUTE_RUN` → `processRunExecution()` | 非文档❌；文档✅（`EXECUTE_RUN`） | `running` | `runByMCP` |
@@ -198,13 +202,22 @@ async function createWorkflowAndStoreMetadata(id, userId) {
 
 ---
 
-### 3.2 触发源 ②：前端手动触发
+### 3.2 触发源 ②：前端手动触发（4 个子入口）
 
-**完整链路：PUT /runs/:id → (有浏览器槽:直接入队 EXECUTE_RUN) / (无槽: Run.status=queued + 轮询) → processRunExecution**
+前端手动触发共有 4 个子入口，全部都入队 `EXECUTE_RUN`，但 Run 创建/复用方式不同：
 
-#### Step 1：入口 API
+| 子入口 | HTTP 方法 | 完整路径 | 核心行为 |
+|--------|----------|---------|---------|
+| ②a | PUT | `/storage/runs/:id` | 创建新 Run，检查浏览器槽位，有则立即入队，无则排队 |
+| ②b | POST | `/storage/runs/run/:id` | **复用已有 Run 记录**，直接重新入队执行 |
+| ②c | POST | `/storage/runs/document-run/:id` | 文档抽取专用，创建新 Run 后直接入队（无浏览器） |
+| ②d | POST | `/storage/runs/document-parse-run/:id` | 文档解析专用，创建新 Run 后直接入队（无浏览器） |
 
-`server/src/routes/storage.ts:997-1131` — `PUT /runs/:id`
+---
+
+#### ②a 普通手动：PUT /storage/runs/:id
+
+`server/src/routes/storage.ts:997-1131`
 
 ```ts
 if (hasAvailableBrowserSlots(userId, "run")) {
@@ -224,9 +237,7 @@ if (hasAvailableBrowserSlots(userId, "run")) {
 }
 ```
 
-#### Step 2：排队任务后续处理
-
-`server/src/routes/storage.ts:1493-1566` — `processQueuedRuns()`
+**排队任务后续处理**：`server/src/routes/storage.ts:1493-1566` — `processQueuedRuns()`
 - 服务启动时 `setInterval` 注册，定时轮询
 - 熔断器：连续 3 次 DB 错误 → 冷却 30 秒 (`server/src/routes/storage.ts:1507-1515`)
 - 处理逻辑：
@@ -236,6 +247,84 @@ if (hasAvailableBrowserSlots(userId, "run")) {
        → 有槽位: Run.update(status:'running') + addJob(EXECUTE_RUN)  (server/src/routes/storage.ts:1539)
        → 无槽位: 跳过，下次再试
   ```
+
+---
+
+#### ②b 重跑复用：POST /storage/runs/run/:id
+
+`server/src/routes/storage.ts:1171-1220`
+
+**核心特点：复用已有 Run 记录，不创建新 Run**
+
+```ts
+const run = await Run.findOne({ where: { runId: req.params.id } });
+// 不更新 Run 状态，直接用已有 runId 和 browserId 入队
+const jobId = await addJob(QUEUE_NAMES.EXECUTE_RUN, {
+  userId: req.user.id,
+  runId: req.params.id,
+  browserId: plainRun.browserId,    // 复用原 browserId
+}, { maxAttempts: 1 });
+```
+
+注意：
+- 不创建新的 Run 记录，沿用原 runId
+- 不主动修改 Run 状态（由 `processRunExecution` 执行时更新为 `running`）
+- 异常时 catch 块会将 Run 状态置为 `failed`
+- 可用于「重跑」已完成或失败的 Run
+
+---
+
+#### ②c 文档抽取专用：POST /storage/runs/document-run/:id
+
+`server/src/routes/storage.ts:2018-2068`
+
+**核心特点：doc-extract 机器人专用，不启动浏览器，直接入队**
+
+```ts
+// 类型校验: recording.recording_meta.type === 'doc-extract'
+
+const runId = uuid();
+await Run.create({
+  status: 'running',                              // 直接标记为 running
+  name: recording.recording_meta.name,
+  robotId: recording.id,
+  robotMetaId: recording.recording_meta.id,
+  startedAt: now,
+  browserId: uuid(),                              // 占位 ID，无真实浏览器
+  interpreterSettings: {
+    maxConcurrency: 1, maxRepeats: 1,
+    debug: false,
+    robotType: 'doc-extract'                     // 文档抽取类型
+  },
+  log: 'Document extraction queued',
+  runId,
+  runByUserId: req.user.id,
+  ...
+});
+
+await addJob(QUEUE_NAMES.EXECUTE_RUN, {
+  userId: req.user.id,
+  runId,
+  browserId: runId,                               // 用 runId 代替 browserId
+}, { maxAttempts: 1 });
+
+serverIo.of('/queued-run').to(`user-${userId}`).emit('run-started', ...);
+```
+
+---
+
+#### ②d 文档解析专用：POST /storage/runs/document-parse-run/:id
+
+`server/src/routes/storage.ts:2074-2124`
+
+**与 ②c 几乎完全一致，仅机器人类型不同**：
+
+- 类型校验：`recording.recording_meta.type === 'doc-parse'`
+- `interpreterSettings.robotType: 'doc-parse'`
+- `log: 'Document parse queued'`
+- 其余逻辑（创建 Run、入队 EXECUTE_RUN、Socket 通知）完全相同
+
+> 两个文档专用入口都**不启动浏览器**，`browserId` 仅为占位符，文档任务由 `processRunExecution` 内的 `executeDocumentRun` / `executeDocumentParseRun` 直接处理，无需 Playwright 实例。
 
 ---
 
@@ -518,18 +607,21 @@ export async function addJob(
 
 ### 6.3 五路触发 → 入队对照表（最终版，已核对）
 
-| 触发源 | 机器人类型 | 是否入队 | 队列名 | maxAttempts | 精确入队位置 |
-|--------|----------|---------|--------|-------------|------------|
-| ① Cron | 非文档 | ✅ | `SCHEDULED_WORKFLOW` | **6** | `server/src/schedule-worker.ts:143` |
-| ① Cron | 文档 | ✅ 两次: 先 SCHEDULED_WORKFLOW, **createWorkflow 内直接二次入队** EXECUTE_RUN（无 socket，直接 return） | `SCHEDULED_WORKFLOW` → `EXECUTE_RUN` | 6 → 1 | 二次入队: `server/src/workflow-management/scheduler/index.ts:115-121` |
-| ② 前端手动(有槽) | 任意 | ✅ | `EXECUTE_RUN` | **1** | `server/src/routes/storage.ts:1069` |
-| ② 前端手动(排队后) | 任意 | ✅ | `EXECUTE_RUN` | **1** | `server/src/routes/storage.ts:1539` |
-| ③ API | 文档 | ✅ | `EXECUTE_RUN` | **1** | `server/src/api/record.ts:632-636` |
-| ③ API | 非文档 | ❌ **不走队列，socket直调** | - | - | - |
-| ④ SDK / CLI | 文档 | ✅ | `EXECUTE_RUN` | **1** | 同 API (共用 handleRunRecording) |
-| ④ SDK / CLI | 非文档 | ❌ **不走队列，socket直调** | - | - | - |
-| ⑤ MCP | 文档 | ✅ | `EXECUTE_RUN` | **1** | 同 API (共用 handleRunRecording) |
-| ⑤ MCP | 非文档 | ❌ **不走队列，socket直调** | - | - | - |
+| 触发源 | 子入口 | 机器人类型 | 是否入队 | 队列名 | maxAttempts | Run 创建/复用 | 精确入队位置 |
+|--------|--------|----------|---------|--------|-------------|--------------|------------|
+| ① Cron | - | 非文档 | ✅ | `SCHEDULED_WORKFLOW` | **6** | 创建新 Run (status: scheduled) | `server/src/schedule-worker.ts:143` |
+| ① Cron | - | 文档 | ✅ 两次：先 SCHEDULED_WORKFLOW，**createWorkflow 内直接二次入队** EXECUTE_RUN（无 socket，直接 return） | `SCHEDULED_WORKFLOW` → `EXECUTE_RUN` | 6 → 1 | 创建新 Run (status: scheduled) | 二次入队: `server/src/workflow-management/scheduler/index.ts:115-121` |
+| ② 前端手动 | ②a `PUT /storage/runs/:id`（普通，有槽） | 任意 | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: running) | `server/src/routes/storage.ts:1069` |
+| ② 前端手动 | ②a `PUT /storage/runs/:id`（普通，无槽排队后） | 任意 | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: queued → running) | `server/src/routes/storage.ts:1539` |
+| ② 前端手动 | ②b `POST /storage/runs/run/:id`（重跑复用） | 任意 | ✅ | `EXECUTE_RUN` | **1** | **复用已有 Run**（不创建新 Run，沿用原状态） | `server/src/routes/storage.ts:1188-1192` |
+| ② 前端手动 | ②c `POST /storage/runs/document-run/:id`（文档抽取） | doc-extract | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: running，无真实浏览器) | `server/src/routes/storage.ts:2047-2051` |
+| ② 前端手动 | ②d `POST /storage/runs/document-parse-run/:id`（文档解析） | doc-parse | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: running，无真实浏览器) | `server/src/routes/storage.ts:2103-2107` |
+| ③ API | - | 文档 | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: running) | `server/src/api/record.ts:632-636` |
+| ③ API | - | 非文档 | ❌ **不走队列，socket直调** | - | - | 创建新 Run (status: running) | - |
+| ④ SDK / CLI | - | 文档 | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: running) | 同 API (共用 handleRunRecording) |
+| ④ SDK / CLI | - | 非文档 | ❌ **不走队列，socket直调** | - | - | 创建新 Run (status: running) | - |
+| ⑤ MCP | - | 文档 | ✅ | `EXECUTE_RUN` | **1** | 创建新 Run (status: running) | 同 API (共用 handleRunRecording) |
+| ⑤ MCP | - | 非文档 | ❌ **不走队列，socket直调** | - | - | 创建新 Run (status: running) | - |
 
 ### 6.4 队列 → 处理器映射
 
@@ -619,7 +711,7 @@ consecutiveDbErrors >= 3
 
 | 字段 | 设置位置（五路触发差异） |
 |------|----------------------|
-| `status` | Cron→`scheduled`; 前端(有槽)→`running`; 前端(无槽)→`queued`; API/SDK/CLI/MCP→`running` |
+| `status` | Cron→`scheduled`; 前端(普通有槽)→`running`; 前端(普通无槽)→`queued`; 前端(重跑复用)→复用原状态; 前端(文档专用)→`running`; API/SDK/CLI/MCP→`running` |
 | `runByScheduleId` | 仅 Cron: `server/src/workflow-management/scheduler/index.ts:83` |
 | `runByAPI` | API 时为 true, MCP 时为 false: `server/src/api/record.ts:601` |
 | `runBySDK` | SDK 时为 true: `server/src/api/record.ts:602` |
