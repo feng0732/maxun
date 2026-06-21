@@ -698,13 +698,22 @@ interface RobotAttributes {
 
 ---
 
-### 8.2 文档类运行是否跳过浏览器代理
+### 8.2 文档类任务的代理链路：分路径结论
 
-**结论：文档类机器人 (doc-extract / doc-parse) 完全跳过浏览器，也完全不应用代理。**
+**统一结论：文档类机器人 (doc-extract / doc-parse) 是否创建浏览器、是否应用代理，取决于执行路径，两条路径结论完全不同，不可一概而论。**
 
-**文件**: `server/src/task-runner.ts`
+| 执行路径 | 是否创建浏览器 | 是否应用代理 | 代理生效与否 |
+|---------|---------------|------------|------------|
+| **正常执行路径**（调度、API、专用文档端点） | ❌ 否（browserId = uuid() 假 ID） | ❌ 否 | 代理与任务无关 |
+| **崩溃恢复排队执行路径**（processQueuedRuns） | ✅ **是**（不必要但真实创建） | ✅ **是**（代理注入 context.proxy） | 代理生效但无人使用 |
 
-在任务执行入口 `processRunExecution()` 中，有两个提前 return 的分支：
+---
+
+#### 8.2.1 正常执行路径：完全跳过浏览器与代理
+
+**文件**: `server/src/task-runner.ts` L130-L179
+
+在任务执行入口 `processRunExecution()` 中，文档类型会提前 return，不走到浏览器逻辑：
 
 ```typescript
 // L155-L165: doc-extract 类型直接 return
@@ -727,19 +736,105 @@ if ((plainRun.interpreterSettings as any)?.robotType === 'doc-parse') {
 }
 ```
 
-**完整跳过路径**：
+**正常路径完整执行流程**：
 
 ```
-processRunExecution()
+创建 Run 阶段 (browserId = uuid() 假 ID):
+  ├─ 调度: scheduler/index.ts L74: browserId = isDocRobot ? uuid() : createRemoteBrowserForRun(userId)
+  ├─ API: record.ts L585: browserId = isDocRobot ? uuid() : createRemoteBrowserForRun(userId)
+  └─ 专用文档端点: storage.ts L2038 / L2094: browserId = uuid()
+
+       ↓
+
+addJob(EXECUTE_RUN)
+       ↓
+
+processRunExecution(data)
     ├─ doc-extract → executeDocumentRun() → return ❌ 无浏览器无代理
     ├─ doc-parse → executeDocumentParseRun() → return ❌ 无浏览器无代理
     └─ 其他类型 → browserPool.getRemoteBrowser() → ✅ 有浏览器有代理
 ```
 
 **注意事项**：
-- 虽然文档机器人不创建浏览器，但它们仍然会被 `QUEUE_NAMES.EXECUTE_RUN` 任务队列处理，`maxAttempts: 1`
-- 文档机器人的运行记录仍然会通过 `recoverOrphanedRuns()` 进行崩溃恢复
-- 如果文档机器人处理的是需要联网的文档（例如通过 URL 拉取 PDF），**这些网络请求不受代理控制**，直接走宿主机默认网络
+- 正常路径下，即使调度的 `createWorkflowAndStoreMetadata` 调用了 `getDecryptedProxyConfig(userId)`（scheduler L58 / record L572），返回结果也只是赋值给本地变量 `proxyOptions`，**没有注入到任何 BrowserContext**
+- 文档机器人仍然会被 `QUEUE_NAMES.EXECUTE_RUN` 任务队列处理，`maxAttempts: 1`
+- 如果文档机器人处理需要联网的文档（例如通过 URL 拉取 PDF），**这些网络请求走宿主机默认网络，不受代理控制**
+
+---
+
+#### 8.2.2 崩溃恢复排队执行路径：错误创建浏览器并初始化代理
+
+**文件**: `server/src/routes/storage.ts` L1493-L1566
+
+崩溃恢复流程中，`processQueuedRuns` 不区分文档任务和浏览器任务，一律创建真实浏览器：
+
+```typescript
+// processQueuedRuns() L1493-L1555
+// ❌ 没有任何 isDocRobot / robotType 判断
+
+async function processQueuedRuns() {
+  // ...
+  const queuedRun = await Run.findOne({ where: { status: 'queued' }, ... });
+  const userId = queuedRun.runByUserId;  // ⚠️ 调度路径可能为 null
+
+  const canCreateBrowser = await browserPool.hasAvailableBrowserSlots(userId, "run");
+  // ❌ 只检查浏览器槽位，不检查是否为文档任务
+
+  if (canCreateBrowser) {
+    try {
+      const newBrowserId = await createRemoteBrowserForRun(userId);  // ✅ 创建真实浏览器
+      // createRemoteBrowserForRun → initializeBrowserAsync → RemoteBrowser.initialize():
+      //   → connectToRemoteBrowser()              // L1: 连接浏览器
+      //   → getDecryptedProxyConfig(userId)        // L2: 读取并解密代理
+      //   → browser.newContext({ proxy })          // L3: 代理注入到 BrowserContext
+
+      await queuedRun.update({ status: 'running', browserId: newBrowserId });
+      await addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId: newBrowserId });
+    } catch (browserError) { ... }
+  }
+}
+```
+
+**然后 `processRunExecution` 才提前 return，浏览器已被创建但无人使用**：
+
+```
+processRunExecution(data)
+    └─ robotType === 'doc-extract' → executeDocumentRun() → return
+        ❌ 浏览器已在 processQueuedRuns 中创建完毕，代理已注入到 context.proxy
+        ❌ 但这个浏览器在整个执行过程中从未被访问，也从未被清理
+```
+
+---
+
+#### 8.2.3 两条路径对恢复流程图和重试边界的影响
+
+**对崩溃恢复流程图的影响**：
+
+```
+服务崩溃 → 重启 → recoverOrphanedRuns()
+    ├─ browserId 是 uuid() 假 ID → 池中不存在 → 视为孤儿
+    └─ status = 'queued'
+         ↓
+    processQueuedRuns()
+        ├─ [正常任务] → createRemoteBrowserForRun() → 正常（浏览器+代理）
+        └─ [文档任务] → createRemoteBrowserForRun() → ⚠️ 不必要但真实创建了浏览器+代理
+             ↓
+        processRunExecution()
+            ├─ [正常任务] → 使用 browserPool.getRemoteBrowser(browserId) → 正确
+            └─ [文档任务] → 提前 return → ❌ 浏览器泄漏 + 代理无人使用
+```
+
+**对重试边界的影响**：
+
+| 重试层级 | 正常路径文档任务 | 恢复路径文档任务 |
+|---------|----------------|----------------|
+| **L1 浏览器连接重试** (connectToRemoteBrowser, 3次) | ❌ 不触发 | ✅ 触发（真实连接浏览器） |
+| **L2 代理层** (newContext({ proxy })) | ❌ 不触发 | ✅ 触发（代理注入 context） |
+| **L3 RemoteBrowser.initialize() 重试** (3次) | ❌ 不触发 | ✅ 触发（浏览器初始化含代理） |
+| **L4 运行级别 retryCount** (上限3) | ✅ 触发（重新入队 queued → 再次触发 processQueuedRuns → 再次创建浏览器！） | ✅ 触发（同上） |
+| **Graphile Worker maxAttempts** (EXECUTE_RUN=1) | ✅ 触发（仅重试 executeDocumentRun） | ✅ 触发（重试整个 processRunExecution，但浏览器已创建） |
+
+**关键风险**：文档任务的运行级别重试每次都会触发 `processQueuedRuns`，每次都会创建一个新的带代理的浏览器实例，但永远不会被使用。**3 次重试 = 泄漏 3 个浏览器槽位 + 3 个代理连接名额**。
 
 ---
 
@@ -923,116 +1018,26 @@ browser.newContext({ proxy: { server, username, password } })  ← 真正生效
 
 ---
 
-## 9. 文档类任务：正常执行 vs 崩溃恢复排队执行的差异
+## 9. 文档类任务深度分析：资源泄漏与用户标识风险
 
-### 9.1 正常执行路径（无需浏览器、无需代理）
+> 本节是 8.2 节的补充，聚焦于代理链路结论之外的深度问题：资源泄漏细节、用户标识来源风险，以及两条路径的完整流程对比。
 
-文档类机器人 (`doc-extract` / `doc-parse`) 正常执行时**完全不接触浏览器和代理**。
-
-**入口一：调度触发** — `server/src/workflow-management/scheduler/index.ts` L42-L121
-
-```
-createWorkflowAndStoreMetadata(id, userId)
-  ├─ getDecryptedProxyConfig(userId)          ← 获取代理配置，仅赋值给 proxyOptions 变量
-  ├─ isDocRobot = true
-  ├─ browserId = uuid()                       ← 生成假 ID，不创建真实浏览器
-  ├─ Run.create({ browserId, interpreterSettings: { robotType } })
-  └─ addJob(EXECUTE_RUN, { userId, runId, browserId }, { maxAttempts: 1 })
-```
-
-**入口二：API 运行** — `server/src/api/record.ts` L552-L637
-
-与调度路径相同：假 browserId，不创建真实浏览器，直接入队。
-
-**入口三：专用文档端点** — `server/src/routes/storage.ts` L2031-L2051 / L2087-L2107
-
-```
-POST /recordings/doc-extract 或 POST /recordings/doc-parse
-  ├─ browserId = uuid()                       ← 假 ID
-  ├─ Run.create({ interpreterSettings: { robotType: 'doc-extract' } })
-  └─ addJob(EXECUTE_RUN, { userId, runId, browserId: runId }, { maxAttempts: 1 })
-                                                    ↑ 注意：browserId = runId，不是真实的
-```
-
-**执行阶段** — `server/src/task-runner.ts` L130-L179
-
-```
-processRunExecution(data)
-  ├─ plainRun.interpreterSettings.robotType === 'doc-extract'
-  │   └─ executeDocumentRun(recording, run, data.userId, serverIo)
-  │       ├─ getDocumentFromMinio(documentKey)     ← 从 MinIO 获取 PDF
-  │       ├─ DocumentInterpreter.extractData(...)   ← LLM 提取
-  │       ├─ run.update({ status: 'success/failed' })
-  │       ├─ serverIo.emit('run-completed', ...)
-  │       └─ sendWebhook(...)
-  │       ❌ 无浏览器创建、无代理应用、无浏览器清理
-  │       return
-  │
-  └─ plainRun.interpreterSettings.robotType === 'doc-parse'
-      └─ executeDocumentParseRun(recording, run, data.userId, serverIo)
-          ├─ getDocumentFromMinio(documentKey)     ← 从 MinIO 获取 PDF
-          ├─ DocumentInterpreter.parse(...)         ← 解析
-          ├─ run.update({ status: 'success/failed' })
-          ├─ serverIo.emit('run-completed', ...)
-          └─ sendWebhook(...)
-          ❌ 无浏览器创建、无代理应用、无浏览器清理
-          return
-```
-
-### 9.2 崩溃恢复排队执行路径（会错误创建浏览器 + 初始化代理）
-
-崩溃恢复流程中，**`processQueuedRuns` 不区分文档任务和浏览器任务**，一律创建浏览器。
-
-**恢复流程** — `server/src/routes/storage.ts` L1572-L1643 + L1493-L1566
-
-```
-服务崩溃 → 服务重启
-  ├─ recoverOrphanedRuns()
-  │   ├─ 查找 status in ['running', 'scheduled'] 的运行
-  │   ├─ browserPool.getRemoteBrowser(runData.browserId)
-  │   │   ├─ 文档任务的 browserId 是 uuid() 假 ID → 必然找不到浏览器
-  │   │   └─ 假 ID 不在池中 → 视为孤儿
-  │   └─ retryCount < 3 → status='queued', browserId=undefined
-  │
-  └─ processQueuedRuns() 每5秒轮询
-      ├─ 找到 queued 状态的文档运行
-      ├─ const userId = queuedRun.runByUserId     ← ⚠️ 可能是 null（见 9.3 节）
-      ├─ browserPool.hasAvailableBrowserSlots(userId, "run")
-      │   └─ 不检查 robotType，检查是否有浏览器槽位
-      ├─ const newBrowserId = createRemoteBrowserForRun(userId)
-      │   ├─ reserveBrowserSlotAtomic(id, userId, "run")
-      │   ├─ initializeBrowserAsync(id, userId)
-      │   │   ├─ connectToRemoteBrowser()          ← L1: 连接浏览器（3次重试+本地回退）
-      │   │   ├─ getDecryptedProxyConfig(userId)   ← L2: 读取并应用代理配置
-      │   │   └─ browser.newContext({ proxy })      ← 代理生效到 BrowserContext
-      │   └─ 浏览器池中创建了一个带代理的真实浏览器实例
-      ├─ queuedRun.update({ status: 'running', browserId: newBrowserId })
-      └─ addJob(EXECUTE_RUN, { userId, runId, browserId: newBrowserId })
-          └─ processRunExecution() 被触发
-              └─ robotType === 'doc-extract'
-                  └─ executeDocumentRun() → return
-                      ❌ 浏览器已创建但从未使用，也从未被清理
-```
-
-### 9.3 正常 vs 恢复路径差异对比
+### 9.1 正常 vs 恢复路径差异对比（与 8.2 对应，不含重复结论）
 
 | 维度 | 正常执行 | 崩溃恢复排队执行 |
 |------|---------|----------------|
 | **browserId 来源** | `uuid()` 假 ID | `createRemoteBrowserForRun()` 创建真实浏览器 |
-| **是否创建浏览器** | ❌ 否 | ✅ **是（不必要）** |
-| **是否应用代理** | ❌ 否 | ✅ **是（代理初始化到 BrowserContext）** |
-| **代理读取** | `getDecryptedProxyConfig()` 被调用但结果仅赋值给变量 | `getDecryptedProxyConfig()` 被调用，代理注入到 `context.proxy` |
-| **浏览器使用** | 不使用 | 不使用（文档分支提前 return） |
-| **浏览器清理** | 不需要 | ❌ **不会清理**，槽位泄漏 |
+| **代理读取** | `getDecryptedProxyConfig()` 被调用但结果仅赋值给局部变量 | `getDecryptedProxyConfig()` 被调用，代理注入到 `context.proxy` |
+| **浏览器清理** | 不需要 | ❌ **不会清理**，槽位泄漏（详见 9.2） |
 | **浏览器槽位占用** | 不占用 | ⚠️ **占用一个槽位**（每个用户上限2个） |
 | **`runByUserId`** | API 路径有值；**调度路径缺失** | 依赖 `queuedRun.runByUserId`，调度路径为 null |
 | **网络请求** | MinIO + LLM，走宿主机默认网络 | 同左，代理与文档处理无关 |
 
-### 9.4 文档分支提前返回后的资源处理问题
+### 9.2 文档分支提前返回后的资源泄漏细节
 
 文档分支 `return` 后，以下资源**无人管理**：
 
-**问题一：崩溃恢复创建的浏览器实例泄漏**
+**问题一：崩溃恢复创建的浏览器实例无法被清理**
 
 ```
 processQueuedRuns() 创建浏览器 → 浏览器池中 reserved → initializing → ready
@@ -1048,11 +1053,28 @@ processRunExecution() 文档分支 return
   文档任务创建的浏览器已经 ready 且 browser≠null → ❌ 不会被清理！
 ```
 
+**代码证据** — `server/src/browser-management/classes/BrowserPool.ts`：
+
+```typescript
+public cleanupStaleBrowserSlots = (): void => {
+    const staleThreshold = 5 * 60 * 1000; // 5 分钟
+    for (const [id, info] of Object.entries(this.pool)) {
+        const isStale = info.status === "reserved" || info.status === "initializing";
+        const age = now - (info.createdAt || 0);
+        // ❗ 只清理 reserved/initializing 且 browser === null 的情况
+        // ❗ ready 状态 + browser !== null 的文档浏览器永远不会被清理
+        if (isStale && info.browser === null && age > staleThreshold) {
+            this.failBrowserSlot(id);
+        }
+    }
+};
+```
+
 **问题二：代理配置已应用但无人使用**
 
 崩溃恢复时，代理被初始化到 BrowserContext。但文档任务不会访问任何网页，代理连接处于空闲状态。如果代理服务器有连接数限制，这会**白白占用一个代理连接名额**。
 
-**问题三：文档执行函数内的资源清理**
+**问题三：文档执行函数内的资源清理盲区**
 
 `executeDocumentRun()` 和 `executeDocumentParseRun()` 自身的资源管理是正确的：
 - 成功时：更新 Run 状态 → emit socket → send webhook
@@ -1061,7 +1083,7 @@ processRunExecution() 文档分支 return
 
 但在崩溃恢复路径中，这些函数**不知道外部已经创建了浏览器**，所以不会清理。
 
-### 9.5 用户标识来源风险：`runByUserId` 在调度路径中缺失
+### 9.3 用户标识来源风险：`runByUserId` 在调度路径中缺失
 
 **核心风险**：调度器创建的运行记录**没有设置 `runByUserId`**，但 `processQueuedRuns` 依赖这个字段。
 
@@ -1093,67 +1115,77 @@ processRunExecution() 文档分支 return
     → 但文档任务根本不需要浏览器！
 ```
 
-**影响**：
-1. 调度触发的运行崩溃恢复后，`runByUserId` 缺失导致 `processQueuedRuns` 行为异常
-2. 即使 `runByUserId` 正确，`processQueuedRuns` 也会为文档任务不必要地创建浏览器
-3. 两个问题叠加：调度触发的文档任务崩溃恢复后，**要么浏览器创建失败（userId=undefined），要么创建成功但永远不用（浏览器槽位泄漏）**
+**两个问题叠加的最终后果**：调度触发的文档任务崩溃恢复后，**要么浏览器创建失败（userId=undefined），要么创建成功但浏览器槽位永久泄漏（ready状态无法被清理）**。
 
-### 9.6 完整流程对比图
+### 9.4 文档类任务两条路径完整流程对比图
 
 ```
-═══════════════════════════════════════════════════════
-正常执行（文档任务）
-═══════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
+路径 A：正常执行（调度 / API / 专用文档端点）
+═══════════════════════════════════════════════════════════════
 
-创建 Run (browserId=uuid假ID)
-  ↓
-addJob(EXECUTE_RUN)
-  ↓
-processRunExecution()
-  ├─ robotType === 'doc-extract'
-  │   └─ executeDocumentRun()
-  │       ├─ MinIO 获取 PDF
-  │       ├─ LLM 提取数据
-  │       ├─ 更新 Run 状态
-  │       └─ return ✅ 完成
-  └─ robotType === 'doc-parse'
-      └─ executeDocumentParseRun()
+创建 Run 阶段:
+  ├─ browserId = uuid()                        ← 假 ID，不创建真实浏览器
+  ├─ Run.create({ browserId, interpreterSettings: { robotType } })
+  └─ addJob(EXECUTE_RUN, { browserId })
+
+任务执行阶段:
+  processRunExecution(data)
+    ├─ doc-extract → executeDocumentRun()
+    │     ├─ MinIO 获取 PDF
+    │     ├─ LLM 提取数据
+    │     ├─ run.update({ status: 'success/failed' })
+    │     └─ return  ✅ 完成
+    └─ doc-parse → executeDocumentParseRun()
           ├─ MinIO 获取 PDF
           ├─ 解析数据
-          ├─ 更新 Run 状态
-          └─ return ✅ 完成
+          ├─ run.update({ status: 'success/failed' })
+          └─ return  ✅ 完成
 
-浏览器: 0个  |  代理应用: 0次  |  槽位占用: 0
+结果统计:
+  浏览器: 0 个    |  代理应用: 0 次    |  槽位占用: 0 个
+  代理影响: 完全不涉及代理
 
 
-═══════════════════════════════════════════════════════
-崩溃恢复排队执行（文档任务）
-═══════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
+路径 B：崩溃恢复排队执行（服务崩溃 → 重启）
+═══════════════════════════════════════════════════════════════
 
-服务崩溃 → 重启
-  ↓
-recoverOrphanedRuns()
-  ├─ 假 browserId 在池中不存在 → 视为孤儿
-  └─ status='queued', browserId=undefined
-  ↓
-processQueuedRuns()
-  ├─ userId = queuedRun.runByUserId  ← ⚠️ 调度路径可能为 null
-  ├─ hasAvailableBrowserSlots(userId)
-  ├─ createRemoteBrowserForRun(userId)
-  │   ├─ 连接远程浏览器（3次重试 + 本地回退）
-  │   ├─ getDecryptedProxyConfig(userId)  ← 读取代理
-  │   └─ newContext({ proxy })            ← 应用代理
-  ├─ queuedRun.update({ browserId: newBrowserId })
-  └─ addJob(EXECUTE_RUN, { browserId: newBrowserId })
-      ↓
-processRunExecution()
-  └─ robotType === 'doc-extract'
-      └─ executeDocumentRun() → return
-          ❌ 浏览器已创建 + 代理已应用，但从未使用
-          ❌ 浏览器实例未被清理，槽位泄漏
-          ❌ 代理连接白白占用
+服务恢复阶段:
+  recoverOrphanedRuns()
+    ├─ browserId 是 uuid() 假 ID → 池中不存在 → 视为孤儿
+    └─ status = 'queued', browserId = undefined, retryCount++
+         ↓
+  processQueuedRuns() 每5秒轮询
+    ├─ userId = queuedRun.runByUserId     ← ⚠️ 调度路径可能为 null
+    ├─ hasAvailableBrowserSlots(userId)
+    └─ createRemoteBrowserForRun(userId)  ← 真实创建浏览器（不必要！）
+          ├─ connectToRemoteBrowser()     ← L1: 3次连接重试 + 本地回退
+          ├─ getDecryptedProxyConfig(userId) ← L2: 读取并解密代理
+          └─ newContext({ proxy })        ← L3: 代理注入 BrowserContext
+          ↓
+    addJob(EXECUTE_RUN, { browserId: newBrowserId })
+         ↓
+任务执行阶段:
+  processRunExecution(data)
+    └─ robotType === 'doc-extract' / 'doc-parse'
+        └─ executeDocumentRun() / executeDocumentParseRun()
+              ├─ MinIO 获取 PDF
+              ├─ 解析 / LLM
+              ├─ run.update({ status: 'success/failed' })
+              └─ return
+                  ❌ 浏览器已创建但从未使用
+                  ❌ 浏览器实例未被清理（ready 状态无法被 stale 清理）
+                  ❌ 代理连接白白占用
 
-浏览器: 1个(泄漏)  |  代理应用: 1次(无用)  |  槽位占用: 1个(浪费)
+结果统计:
+  浏览器: 1 个（泄漏）  |  代理应用: 1 次（无用）  |  槽位占用: 1 个（浪费）
+  代理影响: 代理已注入 BrowserContext，但文档任务从不访问外网，代理空闲
+
+  如果文档任务触发运行级别重试（retryCount 0→1→2→3）:
+    → 每次重试都会再次调用 processQueuedRuns()
+    → 每次都会创建新的浏览器+代理
+    → 3 次重试 = 泄漏 3 个浏览器槽位 + 3 个代理连接名额
 ```
 
 ---
@@ -1208,13 +1240,13 @@ processRunExecution()
 
 即使代理字段是正确写到 User 表（修复 SDK bug 之后），但正在运行的浏览器已经初始化完毕，代理配置已固化在 BrowserContext 里。只有**下次重新创建浏览器**时才会应用新的代理配置。
 
-### 10.8 崩溃恢复为文档任务错误创建浏览器（详细原理见 9.2 节）
+### 10.8 崩溃恢复为文档任务错误创建浏览器（详细原理见 8.2.2 / 9.2 节）
 
 - **问题**：`processQueuedRuns` 不区分文档任务和浏览器任务，一律创建浏览器
 - **影响**：文档任务崩溃恢复后，浏览器实例被创建但从未使用，槽位泄漏；代理被初始化到 BrowserContext 但无人消费
 - **代码证据**：`processQueuedRuns` 无 `robotType` 检查
 
-### 10.9 调度路径 `runByUserId` 缺失（详细原理见 9.5 节）
+### 10.9 调度路径 `runByUserId` 缺失（详细原理见 9.3 节）
 
 - **问题**：`scheduler/index.ts` 中 `Run.create` 不设置 `runByUserId`
 - **影响**：崩溃恢复后 `processQueuedRuns` 取到 null，浏览器创建可能失败或行为异常
