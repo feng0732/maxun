@@ -464,55 +464,73 @@ if (!page) {
 
 ---
 
-### 3.4 动态命名空间清理分析（修正版）
+### 3.4 动态命名空间清理分析（修正版 · 含命名空间类型区分）
 
-之前的"命名空间泄漏"结论需要校准，需要区分**手动销毁缺口**、**Socket.IO 自动清理条件**和**版本不确定性**三个层面。
-
----
-
-#### ① 命名空间创建与清理的基本原理
-
-Socket.IO 的 `io.of(name)` 是**惰性创建**的 — 调用即创建命名空间实例，并存储在内部 `_nsps` Map 中（key 为 `/${id}`）。一旦创建，默认情况下它会**永久保留**，除非：
-1. 被手动从 `_nsps` Map 中删除，**或**
-2. Socket.IO v4.6.0+ 启用了 `cleanupEmptyChildNamespaces: true` 且满足自动清理条件
+之前的分析需要再次校准 — 关键在于区分 Socket.IO 的三种命名空间类型，以及 `cleanupEmptyChildNamespaces` 的**实际适用范围**。
 
 ---
 
-#### ② 版本约束与自动清理能力
+#### ① Socket.IO 命名空间三种类型与 `cleanupEmptyChildNamespaces` 适用性
+
+| 类型 | 创建方式 | 示例 | 是否适用自动清理 |
+|------|---------|------|-----------------|
+| **Main namespace** | 内置默认 | `io.of('/')` | ❌ 否 |
+| **Custom namespace** | 字符串显式创建 | `io.of('/orders')`、`io.of(uuidv4())` | ❌ **否** |
+| **Parent namespace** | 正则/函数动态匹配 | `io.of(/^\/dynamic-\d+$/)`、`io.of((name, auth, next) => {...})` | ❌ 否（Parent 本身不会被清理） |
+| **Child namespace** | 客户端连接到匹配 Parent 的路径时**自动创建**的具体实例 | 客户端连接 `/dynamic-123` 时自动创建，挂在 Parent 下 | ✅ **是（唯一适用的类型）** |
+
+**`cleanupEmptyChildNamespaces` 官方定义**（Socket.IO v4.6.0+）：
+
+> *"Whether to remove [child namespaces](https://socket.io/docs/v4/namespaces/#dynamic-namespaces) that have no sockets connected to them."*
+>
+> *"When a socket disconnects from a **dynamic namespace** and if there are no other sockets connected to it then the namespace will be cleaned up."*
+
+**核心结论**：`cleanupEmptyChildNamespaces` 只适用于**通过正则/函数 Parent 自动生成的 Child namespace**，**不适用于通过字符串显式创建的 Custom namespace**。
+
+---
+
+#### ② 浏览器会话命名空间的实际类型
+
+代码中所有浏览器会话命名空间的创建方式：
+
+| 会话类型 | 创建代码 | 命名空间类型 |
+|---------|---------|-------------|
+| Recording | [controller.ts#L29](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L29) `io.of(id)` | Custom namespace |
+| Run | [controller.ts#L335](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/browser-management/controller.ts#L335) `io.of(id)` | Custom namespace |
+| 全局静态 | [server.ts#L179](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/server.ts#L179) `io.of('/queued-run')` | Custom namespace |
+
+其中 `id` 是 `uuidv4()` 生成的字符串（如 `"a1b2c3d4-..."`）。
+
+**没有任何地方**使用正则表达式（`io.of(/.../)`）或函数（`io.of((name, auth, next) => {...})`）创建动态命名空间。
+
+**重大修正**：尽管代码中设置了 `cleanupEmptyChildNamespaces: true`，但浏览器会话命名空间**全部属于 Custom namespace**，**永远不会被 `cleanupEmptyChildNamespaces` 自动清理**。之前认为"版本 >=4.6.0 且 socket disconnect 就会自动清理"的结论是**错误的**。
+
+---
+
+#### ③ 版本约束与自动清理能力（再次校准）
 
 **依赖版本**：[package.json](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/package.json#L79) 中 `socket.io: "^4.4.1"`
 
 **关键配置**：[server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/107-maxun/server/src/server.ts#L101-L108)
 ```ts
 export let io = new Server(server, {
-  cleanupEmptyChildNamespaces: true,  // ← 已启用
+  cleanupEmptyChildNamespaces: true,  // ← 对浏览器会话命名空间无效
   // ...
 });
 ```
 
-**版本不确定性分析**：
+**修正后的版本影响分析**：
 
-| 实际安装版本 | `cleanupEmptyChildNamespaces` 行为 | 自动清理能力 |
-|-------------|-----------------------------------|-------------|
-| **4.4.1 - 4.5.x** | 选项被 Socket.IO 忽略（无此特性） | ❌ 无自动清理 |
-| **4.6.0+** | 选项生效 | ✅ 有自动清理 |
+| 实际安装版本 | `cleanupEmptyChildNamespaces` 对浏览器会话的作用 | 浏览器会话自动清理能力 |
+|-------------|-----------------------------------------------|----------------------|
+| **4.4.1 - 4.5.x** | 选项被 Socket.IO 忽略（无此特性） | ❌ 无 |
+| **4.6.0+** | 选项生效，但浏览器会话不是 Child namespace，不适用 | ❌ **仍然无** |
 
-`^4.4.1` 的 semver 范围允许安装 4.4.1 到 <5.0.0 的任意版本，因此实际运行时是否有自动清理是**不确定**的，取决于 lockfile 中锁定的版本。
-
-**Socket.IO v4.6.0+ 自动清理条件**（全部满足）：
-1. `cleanupEmptyChildNamespaces: true`
-2. 一个 socket 从该命名空间 disconnect
-3. disconnect 后该命名空间的 `sockets.size === 0`（没有其他连接）
-4. 该命名空间是**动态命名空间**（通过 `io.of(name)` 按需创建的，而非启动时注册的静态命名空间）
-
-满足以上条件时，Socket.IO 会自动：
-- 从 `_nsps` Map 中删除该命名空间
-- 关闭该命名空间的 adapter
-- 释放相关资源
+**结论**：无论安装哪个 Socket.IO 版本，浏览器会话命名空间**都不会被自动清理**。`cleanupEmptyChildNamespaces: true` 对浏览器会话完全不起作用。
 
 ---
 
-#### ③ 代码中三种手动清理模式对比
+#### ④ 代码中三种手动清理模式对比
 
 项目中有三处独立实现的命名空间清理，模式不一致：
 
@@ -535,54 +553,89 @@ if (ns.sockets.size === 0) {                // 4. 再次检查是否为空
 }
 ```
 
-注释掉的逻辑：**即使手动断开了所有 socket，仍然要检查 size 才删除**，这是为了避免并发场景下误删还有连接的命名空间。
+逻辑：**即使手动断开了所有 socket，仍然要检查 size 才删除**，避免并发场景下误删还有连接的命名空间。
 
 ---
 
-#### ④ 失败场景下的命名空间命运分析
+#### ⑤ 失败场景下的命名空间命运分析（最终版）
 
-五种失败场景中，命名空间是否泄漏取决于：
-1. 实际安装的 Socket.IO 版本
-2. 该命名空间是否有过 socket 连接（触发自动清理的前提）
-3. 失败代码路径中是否有手动清理
+由于自动清理不适用于浏览器会话命名空间，失败时是否泄漏完全取决于**是否有手动清理**。
 
-| 失败场景 | 命名空间是否已创建 | 失败时是否手动清理 | Socket.IO 4.6.0+ | Socket.IO 4.4.1-4.5.x |
-|---------|-------------------|-------------------|------------------|----------------------|
-| 录制初始化失败 | ✅ `io.of(id)` 已在 `createSocketConnection` 中调用 | ❌ 无（只清浏览器） | **取决于是否有 socket 连接过**<br>- 前端已连接 → socket disconnect → 自动清理<br>- 前端未连接 → 永久泄漏 | **永久泄漏**<br>（无自动清理，也无手动清理） |
-| 录制入池失败 | ✅ 已创建 | ❌ 无 | 同上 | 同上 |
-| Run 会话初始化失败 | ✅ `io.of(id)` 已在 `initializeBrowserAsync` 中调用 | ❌ 无（只调 `failBrowserSlot`） | 同上 | 同上 |
-| 校验入池失败 | ❌ 未创建（用 dummy socket） | ❌ 无 | ✅ 无影响 | ✅ 无影响 |
-| 校验拿不到 Page | ✅ 已入池 → 走 `destroyRemoteBrowser` → ✅ 有手动清理 | ✅ 有 | ✅ 双重保险（手动+自动） | ✅ 手动清理有效 |
+| 失败场景 | 命名空间是否已创建 | 失败时是否手动清理 | 是否泄漏 | 原因 |
+|---------|-------------------|-------------------|---------|------|
+| 录制初始化失败 | ✅ `io.of(id)` 已在 `createSocketConnection` 中调用 | ❌ 无（只清浏览器） | ✅ **泄漏** | 只有 `switchOff()`，没有清理命名空间 |
+| 录制入池失败 | ✅ 已创建 | ❌ 无 | ✅ **泄漏** | 同上 |
+| Run 会话初始化失败 | ✅ `io.of(id)` 已在 `initializeBrowserAsync` 中调用 | ❌ 无（只调 `failBrowserSlot`） | ✅ **泄漏** | `failBrowserSlot` 只清浏览器和池，不管命名空间 |
+| 校验入池失败 | ❌ 未创建（用 dummy socket） | ❌ 无 | ❌ 无影响 | 根本没创建命名空间 |
+| 校验拿不到 Page | ✅ 已入池 → 走 `destroyRemoteBrowser` | ✅ 有 | ❌ 不泄漏 | 走完整销毁流程，手动清理命名空间 |
 
-**结论修正**：
-- 之前断言"命名空间泄漏"是**不精确**的
-- 如果实际 Socket.IO 版本 >= 4.6.0 **且**失败前有过前端连接，那么 socket disconnect 会触发自动清理，**不会泄漏**
-- 只有在"版本 < 4.6.0"**或**"失败时从未有 socket 连接过"的情况下，才会真正泄漏
+**最终结论修正**：
+- 之前认为"版本 >=4.6.0 且有 socket 连接过就不会泄漏"是**错误的**
+- 实际上，**无论哪个版本**，只要失败路径中没有手动清理，命名空间**一定会泄漏**
 - 校验会话拿不到 Page 是**唯一**失败时走完整销毁流程的场景，不会泄漏
+- `cleanupEmptyChildNamespaces: true` 对浏览器会话命名空间**完全不起作用**
 
 ---
 
-#### ⑤ 为何还要手动清理？
+#### ⑥ 失败路径下如何判断清理结果
 
-既然 v4.6.0+ 有自动清理，代码中为什么还要做 `_nsps.delete()` 的手动清理？
+由于 Socket.IO 不提供官方 API 查询命名空间是否存在，也没有自动清理，只能通过**直接检查内部 `_nsps` Map** 来判断清理结果：
 
-1. **版本兼容性**：应对 `^4.4.1` 可能安装到 <4.6.0 的情况
-2. **无连接场景**：命名空间创建了但从未有 socket 连接时（如失败太快前端还没连上），自动清理不会触发
-3. **事件监听器清理**：自动清理只处理 `_nsps` Map 和 adapter，不清理用户注册的 `connection` 等事件监听器，`namespace.removeAllListeners()` 是必要的
-4. **确定性**：手动清理提供了确定的释放时机，不依赖自动清理的隐式触发条件
+```ts
+// 判断命名空间是否还存在
+const nsps = (io as any)._nsps;
+const stillExists = nsps.has(`/${id}`);
+
+// 完整的清理结果检查逻辑
+function isNamespaceCleanedUp(id: string): boolean {
+  const nsps = (io as any)._nsps;
+  if (!nsps) return true;  // Map 不存在，视为已清理
+
+  if (!nsps.has(`/${id}`)) {
+    return true;  // Key 不存在，已清理
+  }
+
+  const ns = nsps.get(`/${id}`);
+  // 即使 key 还在，如果 sockets 为空且没有监听器，也视为已清理
+  const hasSockets = ns.sockets && ns.sockets.size > 0;
+  const hasListeners = ns.eventNames && ns.eventNames().length > 0;
+  return !hasSockets && !hasListeners;
+}
+```
+
+**三种手动清理模式的结果可预测性**：
+
+| 清理模式 | 调用后 `nsps.has('/${id}')` 结果 | 可预测性 |
+|---------|--------------------------------|---------|
+| destroyRemoteBrowser（有条件） | **不确定** — 取决于 `ns.sockets.size === 0` 检查是否通过 | ❓ 条件依赖 |
+| cleanupSocketConnection（无条件） | `false` — 一定被删除 | ✅ 确定 |
+| 无手动清理（失败路径） | `true` — 一定还在 | ✅ 确定（泄漏） |
+
+**注意**：`destroyRemoteBrowser` 的有条件删除可能导致"清理了 socket 和监听器，但命名空间实例仍留在 `_nsps` Map 中"的半清理状态。这种状态下命名空间不再持有外部资源，但 Map 条目本身仍然存在，属于轻微泄漏。
 
 ---
 
-#### ⑥ `(io as any)._nsps` 的性质
+#### ⑦ 为何还要设置 `cleanupEmptyChildNamespaces: true`？
+
+既然对浏览器会话无效，为什么代码中还要设置这个选项？
+
+1. **面向未来**：如果将来改用正则/函数模式创建动态命名空间（如 `io.of(/^\/session-/)`），这个配置就会生效
+2. **Copy-paste**：可能是从 Socket.IO 文档或其他项目复制配置时带过来的
+3. **避免其他动态命名空间泄漏**：虽然目前没有，但代码中其他地方如果创建了正则/函数模式的动态命名空间，这个配置会生效
+4. **误解**：开发者可能误以为 `cleanupEmptyChildNamespaces` 对所有动态创建的命名空间都有效
+
+---
+
+#### ⑧ `(io as any)._nsps` 的性质
 
 代码中多处使用 `(io as any)._nsps` 直接操作内部 Map，这是因为：
-- Socket.IO 没有提供官方 API 来删除命名空间
+- Socket.IO 没有提供官方 API 来删除或查询命名空间
 - `_nsps` 是私有属性，以 `_` 开头表示不承诺 API 稳定性
 - 这是一个脆弱的依赖，Socket.IO 大版本升级时可能改变内部结构
 
 ---
 
-#### ⑦ `failBrowserSlot` 与直接 `switchOff` 的差异
+#### ⑨ `failBrowserSlot` 与直接 `switchOff` 的差异
 
 | 维度 | `failBrowserSlot(id)` | 直接 `browserSession.switchOff()` |
 |------|----------------------|----------------------------------|
