@@ -367,24 +367,95 @@ schedule-worker (每 30s)        Graphile Worker               scheduler/index.t
 
 ### 5.2 口径②：测试接口直接发送（1 处）
 
-**位置**：[webhook.ts#L356-L361](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L356-L361)
+**位置**：[webhook.ts#L276-L401](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L276-L401)
 
-**注意**：测试接口 **不经过 `sendWebhook()` 分发器**，而是绕过它直接发送：
+**注意**：测试接口 **不经过 `sendWebhook()` 分发器**，也**不经过 `sendWebhookWithRetry()`**，而是绕过它们直接 `axios.post`：
 
 ```typescript
-// webhook.ts#L356-L361
+// webhook.ts#L356-L361  — 测试接口的 axios 配置
 await updateWebhookLastCalled(robotId, webhook.id);
 
 const response = await axios.post(webhook.url, testPayload, {
     timeout: (webhook.timeout || 30) * 1000,
-    validateStatus: (status) => status < 500
+    validateStatus: (status) => status < 500     // ← 关键差异：2xx/3xx/4xx 全部视为「请求成功」
 });
+
+const success = response.status >= 200 && response.status < 300;  // ← 二次判断，仅 2xx 为业务成功
 ```
 
 特点：
 - 事件类型固定为 `event_type: "webhook_test"`（在 payload 中硬编码，不是 `sendWebhook()` 的 eventType 参数）
 - **没有重试逻辑**（只发 1 次，失败立即返回给用户）
 - 只发给用户指定的**单个** webhook URL（不是所有匹配配置）
+- **validateStatus 宽松**：`status < 500` — 2xx、3xx、4xx 不抛异常，只有 5xx、超时、连接错误才进 catch
+
+---
+
+### 5.2.1 测试接口 vs 运行结束回调：失败判定差异总览
+
+两条路径使用了**不同的 validateStatus 规则**，导致对同一 HTTP 状态码的判定完全不同：
+
+| 维度 | 测试接口 `/webhook/test` | 运行结束回调 `sendWebhookWithRetry()` |
+|------|---------------------------|----------------------------------------|
+| 代码位置 | [webhook.ts#L358-L361](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L358-L361) | [webhook.ts#L445-L448](file:///d:/fz/0601-2/solo-dogfeeding/code/117-maxun/server/src/routes/webhook.ts#L445-L448) |
+| `validateStatus` | `status < 500` | `status >= 200 && status < 300` |
+| 判定含义 | 2xx/3xx/4xx = axios 不抛异常 | 仅 2xx = axios 不抛异常 |
+| 5xx、超时、连接错误 | 进 catch | 进 catch |
+| 重试 | ❌ 无重试（只发 1 次） | ✅ 最多 3 次（指数退避 5s → 10s） |
+| 返回给调用方 | HTTP 200 + `details.success` true/false，或 HTTP 500 + 错误信息 | 不返回（静默 resolve，仅打日志） |
+
+#### 各类场景逐条对比
+
+| 场景 | 测试接口行为 | 运行结束回调行为 |
+|------|-------------|-----------------|
+| **2xx（200/201/204）** | ✅ axios resolve → `success=true` → HTTP 200 返回 | ✅ axios resolve → 成功，不重试 |
+| **3xx（301/302/307/308）** | ✅ axios resolve（status<500）→ `success=false` → HTTP 200 返回（details 告知真实状态码） | ❌ axios reject → 进入 catch → **触发重试**（5s → 10s） |
+| **4xx（400/401/403/404/422）** | ✅ axios resolve（status<500）→ `success=false` → HTTP 200 返回（details 告知真实状态码） | ❌ axios reject → 进入 catch → **触发重试**（5s → 10s） |
+| **5xx（500/502/503/504）** | ❌ axios reject → 进 catch → HTTP 500 返回 | ❌ axios reject → 进入 catch → **触发重试**（5s → 10s） |
+| **超时（ETIMEDOUT）** | ❌ axios reject → 进 catch → HTTP 500 返回（错误消息："Request timeout..."） | ❌ axios reject → 进入 catch → **触发重试**（5s → 10s） |
+| **连接拒绝（ECONNREFUSED）** | ❌ axios reject → 进 catch → HTTP 500 返回（错误消息："Connection refused..."） | ❌ axios reject → 进入 catch → **触发重试**（5s → 10s） |
+| **DNS 失败（ENOTFOUND）** | ❌ axios reject → 进 catch → HTTP 500 返回 | ❌ axios reject → 进入 catch → **触发重试**（5s → 10s） |
+
+> **关键差异点**：
+> 1. **3xx 重定向**：测试接口视为「请求成功」仅标记业务失败；运行结束回调视为**完全失败**，触发重试（可能导致重复回调）
+> 2. **4xx 客户端错误**（如 URL 写错返回 404、鉴权失败返回 401/403）：测试接口视为「请求成功」；运行结束回调仍然**重试 3 次**（对可预期的永久错误无意义重试，浪费资源）
+> 3. **5xx/超时/连接错误**：两条路径都视为失败，区别仅在测试接口不重试、运行结束回调重试
+
+#### HTTP 响应格式对比
+
+测试接口返回给前端两种格式：
+
+**1. 2xx/3xx/4xx 场景（axios 没抛异常）**：
+```json
+// HTTP 状态 = 200
+{
+  "ok": true,
+  "message": "Test webhook sent successfully"  // 或 "Webhook endpoint responded with non-success status"
+  "details": {
+    "status": 301,           // 真实 HTTP 状态码
+    "statusText": "Moved Permanently",
+    "success": false         // 只有 2xx 时为 true
+  }
+}
+```
+
+**2. 5xx/超时/连接错误场景（axios 抛异常）**：
+```json
+// HTTP 状态 = 500
+{
+  "ok": false,
+  "error": "Connection refused - webhook URL is not accessible",  // 人类可读错误
+  "details": {
+    "code": "ECONNREFUSED",   // 错误码
+    "message": "connect ECONNREFUSED 127.0.0.1:8080"
+  }
+}
+```
+
+**3. 运行结束回调不返回**：
+- 调用方（13 处业务代码）永远拿到 `Promise<void>` 且 never reject
+- 所有成功/失败均只打印到 `console.log` / `console.error`
+- 第三方系统无法通过 HTTP 响应获知投递结果，只能靠自身确认或查 Maxun 日志
 
 ---
 
@@ -524,7 +595,7 @@ sendWebhook(robotMetaId, eventType, data)
 | 退避公式 | — | `retryDelay × 2^(attempt-1)` | `retryDelay * Math.pow(2, attempt - 1) |
 | 成功判定 | — | `status >= 200 && status < 300` | axios `validateStatus` 回调 |
 
-> **注意**：validateStatus 严格判定 — 3xx 重定向、4xx 客户端错误、5xx 服务端错误**全部视为失败**，触发重试。
+> **注意**：这是**运行结束回调**的判定规则（严格）。测试接口判定规则不同（`status < 500`，2xx/3xx/4xx 都不抛异常），详见 [5.2.1 节](#521-测试接口-vs-运行结束回调失败判定差异总览) 的对比表。运行结束回调中 3xx 重定向、4xx 客户端错误、5xx 服务端错误**全部视为失败**，触发重试。
 
 #### 6.2.2 默认发送次数与等待时序（关键！）
 
