@@ -555,278 +555,287 @@ Webhook 发送失败时采用指数退避重试：
 
 ---
 
-## 十一、三种触发方式对比
+## 十一、四层架构职责边界与 scrape/非 scrape 差异
 
-系统支持三种 Run 触发方式，它们在执行模型、格式转换、数据回写等方面存在显著差异。
+> **修正说明**：之前的分析将 API/SDK/定时任务/后台队列的职责边界混淆了。实际上系统存在 **四套独立的执行代码** 和 **两个同名但不同的 handleRunRecording**。
 
-### 11.1 触发入口总览
+### 11.1 四层架构与职责边界
 
-| 触发方式 | 入口文件 | 核心函数 | 执行模型 |
-|----------|----------|----------|----------|
-| **API 手动触发（SDK）** | [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts) | `POST /api/sdk/robots/:id/execute` | 同步阻塞 + 后台异步执行 |
-| **定时任务触发** | [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | `processDueSchedules` | 异步队列（Graphile Worker） |
-| **后台运行器** | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts) | `processRunExecution` | 异步队列（Graphile Worker） |
+| 层级 | 所在文件 | 核心职责 | **不做什么** |
+|------|----------|----------|-------------|
+| **API 同步等待层** | [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts)、[record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts) | 接收 HTTP 请求、创建 Run 记录、建立 Socket、同步轮询等待结果、格式化 HTTP 响应 | 不直接执行工作流 |
+| **执行层** | [record.ts#L720-L1314](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L720-L1314)、[scheduler/index.ts#L186-L832](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L186-L832)、[task-runner.ts#L130-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L130-L582) | 实际执行浏览器操作、格式转换、截图上传、集成导出、数据库回写、Webhook 发送 | （注意：三套代码高度重复） |
+| **调度层** | [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | 定时轮询 Robot 表、分布式锁认领、计算下次执行时间、派发任务到队列 | 不执行工作流、不处理格式转换 |
+| **后台队列层** | [task-runner.ts#L631-L675](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L631-L675) | Graphile Worker 基础设施：任务队列、并发控制、失败重试、任务分发 | 不包含业务逻辑，只做任务路由 |
+
+#### 关键澄清：两个同名但不同的 handleRunRecording
+
+代码中存在 **两个不同文件、不同参数** 的 `handleRunRecording` 函数，极易混淆：
+
+| 函数 | 所在文件 | 调用方 | 参数 | 用途 |
+|------|----------|--------|------|------|
+| `handleRunRecording(id, userId, runSource, requestedFormats, promptInstructions)` | [record.ts#L1403](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L1403) | API 路由、SDK 路由 | 5 个参数，后 3 个可选 | API/MCP/CLI/SDK 手动触发 |
+| `handleRunRecording(id, userId)` | [scheduler/index.ts#L860](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L860) | SCHEDULED_WORKFLOW 队列 | 仅 2 个参数 | 定时任务触发 |
+
+同样，`createWorkflowAndStoreMetadata` 也有两个版本：
+
+| 函数 | 所在文件 | Run 初始状态 | 是否写入动态参数 |
+|------|----------|-------------|-----------------|
+| `createWorkflowAndStoreMetadata(id, userId, runSource, requestedFormats, promptInstructions)` | [record.ts#L552](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L552) | `status: 'running'` | ✅ 将 formats 和 promptInstructions 写入 interpreterSettings |
+| `createWorkflowAndStoreMetadata(id, userId)` | [scheduler/index.ts#L42](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L42) | `status: 'scheduled'` | ❌ 不写入动态参数 |
 
 ---
 
-### 11.2 触发入口详解
+### 11.2 三套重复的执行层代码
 
-#### 11.2.1 API 手动触发（SDK）
+执行层的核心逻辑（scrape 格式转换、非 scrape 工作流执行、截图上传、集成导出、Webhook）在 **三个文件中重复实现**：
 
-**调用链路：**
-```
-HTTP 请求 → POST /api/sdk/robots/:id/execute
-    ↓
-handleRunRecording(robotId, userId, runSource, requestedFormats, promptInstructions)
-    ↓
-createWorkflowAndStoreMetadata → 创建 Run 记录（status=scheduled）
-    ↓
-建立 Socket 连接 → 监听 ready-for-run 事件
-    ↓
-executeRun → 实际执行工作流
-    ↓
-waitForRunCompletion → 轮询数据库等待 Run 完成（最多 3 小时）
-    ↓
-数据提取与整理 → 返回标准化 JSON 响应
-```
+| 文件 | 核心函数 | 触发场景 | source 标记 | 最大重试次数 |
+|------|----------|----------|-------------|-------------|
+| [api/record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts) | `executeRun(id, userId)` | API/MCP/CLI 手动触发 | `"api"` | 0（无重试） |
+| [workflow-management/scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts) | `executeRun(id, userId)` | 定时任务触发 | `"scheduled"` | 3 次（retryCount 检查） |
+| [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts) | `processRunExecution(data)` | EXECUTE_RUN 队列（文档机器人、前端手动运行） | `"manual"` | 由 Graphile Worker 控制 |
 
-**核心特点：**
-- **支持动态参数**：可在请求体中覆盖 `formats` 和 `promptInstructions`
-  ```typescript
-  const requestedFormats = req.body?.formats as OutputFormats[] | undefined;
-  const promptInstructions = req.body?.promptInstructions;
-  ```
-  代码位置：[sdk.ts#L691-L692](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts#L691-L692)
+三套代码的业务逻辑 **几乎完全相同**，差异仅在：
+- 错误日志的前缀不同
+- telemetry capture 的 source 字段不同
+- Abort 检查粒度不同（task-runner.ts 最多节点）
+- task-runner.ts 额外支持 doc-extract/doc-parse 文档机器人
 
-- **同步等待结果**：通过 `waitForRunCompletion` 轮询数据库，每 2 秒检查一次 Run 状态
-  代码位置：[waitForRunCompletion](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts#L806-L828)
+---
 
-- **响应数据标准化**：返回前对数据库原始数据进行结构整理
-  ```typescript
-  return {
-    runId: run.runId,
-    status: run.status,
-    data: {
-      textData: run.serializableOutput?.scrapeSchema || {},
-      listData: listData,           // 从 scrapeList 提取
-      crawlData: crawlData,         // 从 crawl 提取
-      searchData: searchData,       // 从 search 提取
-      text: text,                   // 从 text[0].content 提取
-      markdown: markdown,           // 从 markdown[0].content 提取
-      html: html,                   // 从 html[0].content 提取
-      summary: summary,             // 从 summary[0].content 提取
-      promptResult: promptResult    // 从 promptResult[0].content 提取
-    },
-    screenshots: Object.values(run.binaryOutput || {})
-  };
-  ```
-  代码位置：[sdk.ts#L776-L793](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts#L776-L793)
+### 11.3 scrape vs 非 scrape 的核心差异（最重要）
 
-#### 11.2.2 定时任务触发
+**scrape 类型和非 scrape 类型（extract/crawl/search）走的是完全不同的执行路径**，这是之前文档最大的遗漏：
 
-**调度流程：**
-```
-startScheduleWorker()
-    ↓
-setInterval(processDueSchedules, 30000)  // 每 30 秒轮询一次
-    ↓
-claimDueDbSchedules()
-    ├─ pg_try_advisory_xact_lock  // 分布式锁，防止多实例重复调度
-    ├─ 查询 Robot 表中 schedule.nextRunAt <= now 的记录
-    ├─ FOR UPDATE SKIP LOCKED     // 行级锁，跳过已被锁定的行
-    └─ 更新 schedulerClaimedAt = now 标记认领
-    ↓
-addJob(QUEUE_NAMES.SCHEDULED_WORKFLOW, { robotMetaId, userId })
-    ↓
-Graphile Worker 消费 → handleRunRecording(robotMetaId, userId)
-    ↓
-finalizeSchedule()
-    ├─ 计算 nextRunAt（通过 cron 表达式）
-    ├─ 更新 lastRunAt 和 nextRunAt
-    └─ 清除 schedulerClaimedAt
-```
+| 对比维度 | scrape 机器人 | 非 scrape 机器人（extract/crawl/search） |
+|----------|--------------|----------------------------------------|
+| **是否经过 InterpretRecording** | ❌ **不经过**，直接调用格式转换函数 | ✅ **经过**，调用 `browser.interpreter.InterpretRecording()` |
+| **是否经过批量持久化缓冲区** | ❌ **不经过**，数据直接组装 | ✅ **经过**，通过 persistenceBuffer 批量写库 |
+| **数据写库时机** | 全部完成后 **一次性 update** | 执行中 **实时批量写库**（Interpreter 回调）+ 完成后追加 update |
+| **格式转换入口** | 直接调用 `convertPageToMarkdown/HTML/Text/Links/Screenshot()` | InterpretRecording → `processRobotOutputFormats()`（仅 crawl/search） |
+| **截图获取方式** | `convertPageToScreenshot(url, page, fullPage)` 直接生成 | InterpretRecording 的 `binaryCallback` 回调收集 |
+| **Interpreter.setRunId()** | ❌ 不调用 | ✅ 调用，用于实时持久化绑定 |
+| **输出格式** | markdown/html/text/links/screenshot-visible/screenshot-fullpage/summary/promptResult | scrapeSchema/scrapeList/crawl/search + 后处理派生格式 |
 
-**调度配置参数：**
+#### 差异详解：格式转换
+
+**scrape 机器人路径**（完全绕开 Interpreter）：
 ```typescript
-DB_SCHEDULER_BATCH_SIZE = 10;          // 每批最多认领 10 个任务
-DB_SCHEDULER_POLL_MS = 30000;           // 轮询间隔 30 秒
-DB_SCHEDULER_CLAIM_TIMEOUT_MS = 600000; // 认领超时 10 分钟
+// api/record.ts / scheduler/index.ts / task-runner.ts 中都有这段逻辑
+if (recording.recording_meta.type === 'scrape') {
+    const formats = run.interpreterSettings?.formats || recording.recording_meta.formats || ['markdown'];
+    
+    // 直接调用格式转换函数，不经过 InterpretRecording
+    if (formats.includes('markdown')) {
+        markdown = await convertPageToMarkdown(url, currentPage);
+        serializableOutput.markdown = [{ content: markdown }];
+    }
+    if (formats.includes('html')) {
+        html = await convertPageToHTML(url, currentPage);
+        serializableOutput.html = [{ content: html }];
+    }
+    if (formats.includes('text')) {
+        text = await convertPageToText(url, currentPage);
+        serializableOutput.text = [{ content: text }];
+    }
+    if (formats.includes('links')) {
+        links = await convertPageToLinks(url, currentPage);
+        serializableOutput.links = links.map(link => ({ url: link }));
+    }
+    if (formats.includes('screenshot-visible')) {
+        buf = await convertPageToScreenshot(url, currentPage, false);
+        binaryOutput['screenshot-visible'] = { data: buf.toString('base64'), mimeType: 'image/png' };
+    }
+    if (formats.includes('screenshot-fullpage')) {
+        buf = await convertPageToScreenshot(url, currentPage, true);
+        binaryOutput['screenshot-fullpage'] = { data: buf.toString('base64'), mimeType: 'image/png' };
+    }
+    if (formats.includes('summary')) {
+        summaryText = await summarizeMarkdown(markdown, llmConfig);
+        serializableOutput.summary = [{ content: summaryText }];
+    }
+    // promptInstructions → executeBrowserAgent()
+}
 ```
+代码位置（以 API 层为例）：[record.ts#L805-L958](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L805-L958)
 
-代码位置：[schedule-worker.ts#L14-L17](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts#L14-L17)
-
-**分布式锁机制：**
-```sql
-SELECT pg_try_advisory_xact_lock(43821742) AS locked
-```
-使用 PostgreSQL 咨询锁确保同一时刻只有一个调度实例在认领任务。
-
-代码位置：[claimDueDbSchedules](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts#L29-L85)
-
-#### 11.2.3 后台运行器
-
-**任务队列：**
-```
-addJob(QUEUE_NAMES.EXECUTE_RUN, { userId, runId, browserId })
-    ↓
-Graphile Worker 消费 → processRunExecution(data)
-```
-
-队列定义：[task-runner.ts#L37-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L37-L45)
-
----
-
-### 11.3 核心差异对比表
-
-| 对比维度 | API 手动触发（SDK） | 定时任务触发 | 后台运行器 |
-|----------|---------------------|-------------|-----------|
-| **执行模型** | 同步 HTTP 阻塞 + 后台异步 | 纯异步队列 | 纯异步队列 |
-| **入口函数** | `handleRunRecording(robotId, userId, runSource, requestedFormats, promptInstructions)` | `handleRunRecording(robotMetaId, userId)` | `processRunExecution({userId, runId, browserId})` |
-| **Run 创建时机** | 调用时同步创建 | 调度认领时创建 | 任务入队前创建 |
-| **动态 formats** | ✅ 支持（请求体覆盖） | ❌ 使用机器人默认配置 | ❌ 使用机器人默认配置 |
-| **动态 promptInstructions** | ✅ 支持（请求体覆盖） | ❌ 使用机器人默认配置 | ✅ 支持（通过 interpreterSettings） |
-| **返回结果** | 标准化 JSON 响应（同步） | 无直接返回（异步） | 无直接返回（异步） |
-| **source 标记** | `sdk` 或 `cli` | `scheduled` | `manual` |
-| **Abort 检查** | ❌ 无 | ✅ 有（executeRun 中检查） | ✅ 有（关键点多次检查） |
-| **格式转换时机** | 执行中同步转换 | 执行中同步转换 | 执行中同步转换 |
-| **截图上传时机** | 执行完成后立即上传 | 执行完成后立即上传 | 执行完成后立即上传 |
-| **集成导出时机** | 执行完成后立即触发 | 执行完成后立即触发 | 执行完成后立即触发 |
-| **最大等待时间** | 3 小时（API 层） | 10 分钟（工作流执行） | 10 分钟（工作流执行） |
-
----
-
-### 11.4 各环节详细差异
-
-#### 11.4.1 格式转换（Format Conversion）
-
-| 机器人类型 | API 手动触发 | 定时任务触发 | 后台运行器 |
-|-----------|-------------|-------------|-----------|
-| **scrape 类型** | 优先使用 `requestedFormats`，无则用 `recording_meta.formats`，最后默认 `['markdown']` | 仅使用 `recording_meta.formats`，默认 `['markdown']` | 仅使用 `recording_meta.formats`，默认 `['markdown']` |
-| **crawl/search 类型** | 后处理阶段使用 `recording_meta.formats` | 后处理阶段使用 `recording_meta.formats` | 后处理阶段使用 `recording_meta.formats` |
-
-**代码差异：**
-- API 触发：
-  ```typescript
-  const rawFormats = run.interpreterSettings?.formats || recording.recording_meta.formats;
-  ```
-  代码位置：[scheduler/index.ts#L269](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L269)
-
-- 后台运行器：
-  ```typescript
-  const rawFormats = run.interpreterSettings?.formats || recording.recording_meta.formats;
-  ```
-  代码位置：[task-runner.ts#L242](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L242)
-
-#### 11.4.2 截图上传（Binary Upload）
-
-三种触发方式的截图上传逻辑 **完全一致**，都在执行完成后调用 `BinaryOutputService.uploadAndStoreBinaryOutput`：
-
+**非 scrape 机器人路径**（经过 Interpreter + 批量持久化）：
 ```typescript
-const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
-const uploadedBinaryOutput = Object.keys(binaryOutput).length > 0
-  ? await binaryOutputService.uploadAndStoreBinaryOutput(run, binaryOutput)
-  : {};
+// 1. 设置 Run ID，启用实时持久化
+browser.interpreter.setRunId(plainRun.runId);
+
+// 2. 调用工作流解释器执行 —— 内部通过回调实时批量写库
+const interpretationInfo = await browser.interpreter.InterpretRecording(
+    AddGeneratedFlags(recording.recording),
+    currentPage,
+    (newPage) => currentPage = newPage,
+    plainRun.interpreterSettings
+);
+
+// 3. crawl/search 类型额外进行格式后处理
+if (robotType === 'crawl' || robotType === 'search') {
+    const processedOutput = await processRobotOutputFormats({
+        robotType,
+        outputFormats,
+        categorizedOutput,
+        currentPage,
+        initialBinaryOutput,
+        llmConfig,
+    });
+    // 后处理结果追加写库
+}
 ```
+代码位置（以 API 层为例）：[record.ts#L1112-L1167](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L1112-L1167)
 
-代码位置：
-- 定时任务：[scheduler/index.ts#L650-L653](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L650-L653)
-- 后台运行器：[task-runner.ts#L461-L463](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L461-L463)
+#### 差异详解：截图上传
 
-#### 11.4.3 集成导出（Integration Export）
+| 机器人类型 | 截图数据来源 | 上传时机 |
+|-----------|-------------|---------|
+| **scrape** | `convertPageToScreenshot()` 直接返回 Buffer | 所有格式转换完成后 → 组装 serializableOutput + binaryOutput → 一次性写库 → 立即上传 MinIO |
+| **非 scrape** | InterpretRecording 的 `binaryCallback` 回调 → 暂存 interpreter.binaryData → **实时写库**（persistBinaryDataToDatabase） | InterpretRecording 完成后从数据库读取已有 binaryOutput → 加上后处理新增截图 → 统一上传 MinIO → 更新数据库 |
 
-三种触发方式的集成导出逻辑 **完全一致**，都调用 `triggerIntegrationUpdates`：
+**关键区别**：scrape 的截图数据 **从未进入 Interpreter 的内存数据结构**，完全在 executeRun 函数内局部变量中流转；非 scrape 的截图在 Interpreter 内部产生，通过回调实时写入数据库。
 
+#### 差异详解：集成导出
+
+scrape 和非 scrape 的集成导出逻辑 **完全相同**，都调用同一个 `triggerIntegrationUpdates()` 函数：
+1. scrape：格式转换全部完成后调用
+2. 非 scrape：InterpretRecording + 格式后处理全部完成后调用
+
+该函数内部逻辑：
 ```typescript
-await triggerIntegrationUpdates(plainRun.runId, plainRun.robotMetaId);
+addGoogleSheetUpdateTask(runId, { robotId, runId, status: 'pending', retries: 5 });
+addAirtableUpdateTask(runId, { robotId, runId, status: 'pending', retries: 5 });
+withTimeout(processAirtableUpdates(), 65000, 'Airtable update');
+withTimeout(processGoogleSheetUpdates(), 65000, 'Google Sheets update');
 ```
 
-该函数内部：
-1. 添加 Google Sheets 更新任务到队列
-2. 添加 Airtable 更新任务到队列
-3. 异步执行 `processAirtableUpdates()` 和 `processGoogleSheetUpdates()`
-4. 每个任务有 65 秒超时限制
+代码位置：[record.ts#L665-L689](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L665-L689)
 
-代码位置：
-- 定时任务：[scheduler/index.ts#L755](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L755)
-- 后台运行器：[task-runner.ts#L508](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L508)
+#### 差异详解：数据库回写
 
-#### 11.4.4 数据库回写（Database Write-back）
+| 机器人类型 | 写库次数 | 写库内容 | 写库时机 |
+|-----------|---------|---------|---------|
+| **scrape** | **2 次** | 1. status = running（创建时）<br>2. status = success/failed + serializableOutput + binaryOutput（全部完成后一次性） | 全部格式转换完成后 |
+| **非 scrape** | **N + 2 次以上** | 1. status = running（创建时）<br>2. 多次实时写入 scrapeSchema/scrapeList/crawl/search（批量缓冲区触发）<br>3. 多次实时写入 binaryOutput（截图回调触发）<br>4. crawl/search 后处理结果追加 update<br>5. status = success/failed + log + 最终 binaryOutput | 执行过程中持续写入 + 最终写入 |
 
-| 触发方式 | 数据库回写时机 | 状态流转 |
-|----------|----------------|----------|
-| **API 手动触发** | 执行中实时批量写入 + 完成时最终更新 | scheduled → running → success/failed |
-| **定时任务触发** | 执行中实时批量写入 + 完成时最终更新 | scheduled → running → success/failed |
-| **后台运行器** | 执行中实时批量写入 + 完成时最终更新<br>**关键点检查 Run 是否被 Abort** | scheduled → running → success/failed/aborted |
-
-**Abort 检查差异**：
-
-后台运行器在多个关键点检查 Run 是否被中止：
-1. 执行开始前检查 `run.status === 'aborted' || run.status === 'aborting'`
-2. 工作流解释完成后检查 `await isRunAborted()`
-3. 格式后处理后检查 `await isRunAborted()`
-
-```typescript
-const isRunAborted = async (): Promise<boolean> => {
-  const currentRun = await Run.findOne({ where: { runId: data.runId } });
-  return currentRun ? (currentRun.status === 'aborted' || currentRun.status === 'aborting') : false;
-};
+数据库写库次数差异图示：
 ```
+scrape:
+  [创建] → running → [等待格式转换] → [一次性写入所有输出] → success/failed
+            1次                                  1次                  共2次
 
-代码位置：[task-runner.ts#L381-L386](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L381-L386)
-
-#### 11.4.5 Webhook 触发
-
-| 触发方式 | Webhook Payload 差异 |
-|----------|---------------------|
-| **API 手动触发** | 与定时任务、后台运行器一致，包含完整的 extracted_data |
-| **定时任务触发** | 包含完整的 extracted_data（captured_texts、captured_lists、crawl_data、search_data） |
-| **后台运行器** | 包含完整的 extracted_data，失败时额外包含 partial_data_extracted 标记 |
-
----
-
-### 11.5 触发路径完整流程图
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              触发入口层                                      │
-├─────────────────────────────────┬───────────────────────────┬───────────────┤
-│  API /sdk/robots/:id/execute    │  schedule-worker 轮询     │  前端手动运行  │
-│  (同步等待)                     │  (30秒轮询 + 分布式锁)    │  (入队执行)    │
-└─────────────────┬───────────────┴─────────────┬─────────────┴───────────────┘
-                  │                             │
-                  ▼                             ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          handleRunRecording 入口                             │
-│  参数：(robotId, userId, runSource?, requestedFormats?, promptInstructions?)│
-│  功能：创建 Run 记录 → 建立 Socket → 触发 executeRun                        │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          executeRun (scheduler/index.ts)                    │
-│  scrape 机器人：直接格式转换 → 截图上传 → 集成导出                           │
-│  其他机器人：InterpretRecording → 格式后处理 → 截图上传 → 集成导出            │
-│  source 标记：scheduled                                                      │
-└───────────────────────────────────────────┬─────────────────────────────────┘
-                                            │
-                                            ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        processRunExecution (task-runner.ts)                 │
-│  scrape 机器人：直接格式转换 → 截图上传 → 集成导出                           │
-│  其他机器人：InterpretRecording → 格式后处理 → 截图上传 → 集成导出            │
-│  ✅ 多节点 Abort 检查                                                        │
-│  source 标记：manual                                                         │
-└─────────────────────────────────────────────────────────────────────────────┘
+非 scrape (extract/crawl/search):
+  [创建] → running → InterpretRecording(执行中持续批量写库) → 后处理 → 最终状态
+            1次         N次(每次满5条或3秒) + M次(截图)      1次     1次   共N+M+3次
 ```
 
 ---
 
-### 11.6 触发入口代码索引
+### 11.4 完整触发路径（修正版）
 
-| 文件 | 触发方式 | 关键函数 |
-|------|----------|----------|
-| [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts) | API 手动触发 | `POST /api/sdk/robots/:id/execute`、`waitForRunCompletion` |
-| [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | 定时任务触发 | `claimDueDbSchedules`、`processDueSchedules`、`finalizeSchedule` |
-| [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts) | 定时任务执行 | `handleRunRecording`、`createWorkflowAndStoreMetadata`、`executeRun` |
-| [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts) | 后台运行器 | `processRunExecution`、`abortRun`、`QUEUE_NAMES` |
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                            API 同步等待层（不执行）                                │
+│  [record.ts] POST /api/record/run/:id                                            │
+│  [sdk.ts]    POST /api/sdk/robots/:id/execute                                    │
+│        │                                                                         │
+│        ▼                                                                         │
+│  handleRunRecording(record.ts, 5参数)                                             │
+│        │  → createWorkflowAndStoreMetadata(创建 Run, status='running')           │
+│        │  → 建立 Socket 连接，监听 ready-for-run                                  │
+│        ▼                                                                         │
+│  waitForRunCompletion（仅 SDK，每 2 秒轮询数据库）                                 │
+│        │                                                                         │
+│        ▼                                                                         │
+│  标准化响应（提取 textData/listData/crawlData/searchData/text/markdown/html...） │
+└──────────────────────────────────┬───────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              调度层（不执行）                                      │
+│  [schedule-worker.ts]                                                            │
+│        │                                                                         │
+│        ▼                                                                         │
+│  setInterval(processDueSchedules, 30000)  // 每 30 秒轮询                        │
+│        │                                                                         │
+│        ▼                                                                         │
+│  claimDueDbSchedules()                                                           │
+│    ├─ pg_try_advisory_xact_lock(43821742)    // 分布式咨询锁                      │
+│    ├─ FOR UPDATE SKIP LOCKED                  // 行级锁                          │
+│    └─ 更新 schedulerClaimedAt = now           // 认领标记                        │
+│        │                                                                         │
+│        ▼                                                                         │
+│  addJob(QUEUE_NAMES.SCHEDULED_WORKFLOW, { robotMetaId, userId })                 │
+│        │                                                                         │
+│        ▼                                                                         │
+│  finalizeSchedule() → 计算 nextRunAt、更新 lastRunAt                             │
+└──────────────────────────────────┬───────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           后台队列层（只做路由）                                   │
+│  Graphile Worker (task-runner.ts)                                                │
+│        │                                                                         │
+│        ├─ QUEUE_NAMES.SCHEDULED_WORKFLOW → handleRunRecording(scheduler/, 2参数) │
+│        │       → createWorkflowAndStoreMetadata(创建 Run, status='scheduled')    │
+│        │       → 建立 Socket → 监听 ready-for-run                                │
+│        │                                                                         │
+│        └─ QUEUE_NAMES.EXECUTE_RUN → processRunExecution()  // 文档机器人等       │
+└──────────────────────────────────┬───────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                          执行层（三套重复代码）                                    │
+│                                                                                  │
+│  if (type === 'scrape') {                  if (type !== 'scrape') {              │
+│    // 直接格式转换                                // InterpretRecording           │
+│    convertPageToMarkdown()                       browser.interpreter.setRunId()  │
+│    convertPageToHTML()                            browser.interpreter.           │
+│    convertPageToText()                              InterpretRecording()         │
+│    convertPageToLinks()                           // 内部批量实时写库             │
+│    convertPageToScreenshot()                      ↓                             │
+│    summarizeMarkdown()                        crawl/search:                     │
+│    executeBrowserAgent()                        processRobotOutputFormats()     │
+│  }                                            }                                  │
+│        │                                                                         │
+│        ▼                                                                         │
+│  BinaryOutputService.uploadAndStoreBinaryOutput() → MinIO                        │
+│        │                                                                         │
+│        ▼                                                                         │
+│  sendWebhook() → 外部 Webhook URL                                                │
+│        │                                                                         │
+│        ▼                                                                         │
+│  triggerIntegrationUpdates() → Google Sheets + Airtable                         │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 11.5 scrape vs 非 scrape 差异汇总表
+
+| 环节 | scrape | extract | crawl | search |
+|------|--------|---------|-------|--------|
+| **经过 InterpretRecording** | ❌ | ✅ | ✅ | ✅ |
+| **经过批量持久化缓冲区** | ❌ | ✅ | ✅ | ✅ |
+| **实时写库** | ❌（一次性） | ✅ | ✅ | ✅ |
+| **调用 processRobotOutputFormats** | ❌ | ❌ | ✅ | ✅ |
+| **输出到 serializableOutput 的 key** | markdown/html/text/links/summary/promptResult/scrape | scrapeSchema/scrapeList | crawl + 派生的 markdown/html/text/links/summary | search + 派生的 markdown/html/text/links/summary |
+| **截图数据来源** | convertPageToScreenshot() | binaryCallback | binaryCallback + 后处理新增 | binaryCallback + 后处理新增 |
+| **setRunId() 调用** | ❌ | ✅ | ✅ | ✅ |
+| **格式参数来源** | interpreterSettings.formats → recording_meta.formats → 默认 markdown | recording_meta.formats | interpreterSettings.formats → recording_meta.formats → 默认 markdown | interpreterSettings.formats → recording_meta.formats（discover 模式默认空数组，scrape 模式默认 markdown） |
+
+---
+
+### 11.6 触发入口代码索引（修正版）
+
+| 文件 | 层级 | 关键函数 | 说明 |
+|------|------|----------|------|
+| [sdk.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/sdk.ts) | API 同步等待层 | `POST /api/sdk/robots/:id/execute`、`waitForRunCompletion` | SDK 入口：调用 record.ts 的 handleRunRecording + 同步轮询 |
+| [record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts) | API 同步等待层 + 执行层 | `handleRunRecording(5参数)`、`POST /api/record/run/:id`、`createWorkflowAndStoreMetadata(5参数)`、`executeRun(id, userId)` | **两套职责在同一文件**：API 入口 + 实际执行逻辑 |
+| [schedule-worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/schedule-worker.ts) | 调度层 | `claimDueDbSchedules`、`processDueSchedules`、`finalizeSchedule` | 只负责定时扫描、分布式锁、派发任务到队列 |
+| [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts) | 执行层 | `handleRunRecording(2参数)`、`createWorkflowAndStoreMetadata(2参数)`、`executeRun(id, userId)` | 定时任务的实际执行逻辑（与 record.ts 中 executeRun 高度重复） |
+| [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts) | 后台队列层 + 执行层 | `QUEUE_NAMES`、`processRunExecution`、`abortRun`、Graphile Worker 任务列表 | **两套职责在同一文件**：Worker 基础设施 + EXECUTE_RUN 队列的实际执行逻辑 |
+
 
