@@ -210,7 +210,7 @@ p.on('popup', popupHandler);
 
 ---
 
-### 3.2 自定义动作详解
+### 3.2 自定义动作详解（含逐类失败语义）
 
 #### (1) scrapeSchema - 结构化数据抓取
 
@@ -225,6 +225,10 @@ const scrapeResult = await page.evaluate(
 ```
 
 **数据累积策略**：连续的 `scrapeSchema` 结果会合并到同一行数据（除非有重复字段检测到，才另起新行）。
+
+**失败语义**：无 try-catch
+- editor 模式：early return，写空对象 `{}` 回调 → 正常返回，整组移除
+- 非 editor 模式：waitForDynamicStability / ensureScriptsLoaded / page.evaluate 任一失败 → **向上抛错**，整组保留重试
 
 #### (2) scrapeList - 列表数据抓取
 
@@ -243,7 +247,53 @@ const scrapeResult = await page.evaluate(
 - Shadow DOM / iframe 穿透：使用 `>>` 和 `:>>` 分隔符
 - 分页选择器重试：MAX_RETRIES=3，每次间隔 RETRY_DELAY=1000ms
 
-#### (3) crawl - 全站爬取
+**失败语义**：外层完整 try-catch
+- 无分页模式：page.evaluate 内部还有一层 try-catch，失败返回 `[]`
+- 外层 catch：写空数组 `[]` → 调用 serializableCallback → **正常返回，不抛错**
+- 整组动作**正常移除**，不会触发重试
+
+#### (3) scrapeListAuto - 自动列表选择器发现
+
+**失败语义**：无 try-catch
+- page.evaluate(window.scrapeListAuto) 失败 → **向上抛错**，整组保留重试
+
+#### (4) scrape - 启发式抓取
+
+**失败语义**：无 try-catch
+- waitForDynamicStability / ensureScriptsLoaded / page.evaluate 任一失败 → **向上抛错**，整组保留重试
+
+#### (5) screenshot - 页面截图
+
+**失败语义**：无 try-catch
+- waitForImagesLoaded / page.screenshot / binaryCallback 任一失败 → **向上抛错**，整组保留重试
+
+#### (6) scroll - 页面滚动
+
+**失败语义**：无 try-catch
+- page.evaluate(scrollTo) 失败 → **向上抛错**，整组保留重试
+
+#### (7) enqueueLinks - 多页面并发抓取
+
+**失败语义**：主流程无 try-catch，内部并发任务有隔离
+- page.locator(...).evaluateAll 提取链接失败 / page.close 失败 → **向上抛错**，整组保留重试
+- 单个链接打开后执行 runLoop 失败：内部 addJob 包裹 try-catch 吞掉 → 不影响其他链接，不抛错到外层
+
+#### (8) script - 自定义代码注入
+
+```typescript
+try {
+  const x = new AsyncFunction('page', 'log', code);
+  await x(page, this.log);
+} catch (error: any) {
+  this.log(`Script execution failed: ${error.message}`, Level.ERROR);
+  throw new Error(`Script execution error: ${error.message}`);
+}
+```
+
+**失败语义**：有 try-catch，但 **catch 里重新 throw**
+- 代码执行失败 → 记录 ERROR 日志 → 重新包装错误后抛出 → **向上抛错**，整组保留重试
+
+#### (9) crawl - 全站爬取
 
 **广度优先搜索 (BFS) 算法**：
 ```
@@ -260,13 +310,25 @@ While 队列非空 && 结果数 < limit:
 
 可配置项：`mode`(domain/subdomain/path)、`limit`、`maxDepth`、`useSitemap`、`respectRobots`。
 
-#### (4) search - 搜索引擎抓取
+**失败语义**：整体有 try-catch，但 **catch 里重新 throw**
+- 内部 robots.txt 获取、单页面抓取失败有小范围 try-catch 降级
+- 整体流程致命失败 → 记录 ERROR 日志 → 重新包装错误后抛出 → **向上抛错**，整组保留重试
+
+#### (10) search - 搜索引擎抓取
 
 流程：构造 DuckDuckGo 搜索 URL → 提取搜索结果列表 → (可选) 逐个访问结果页抓取完整内容。
 
-#### (5) flag - 断点/暂停标记
+**失败语义**：整体有 try-catch，但 **catch 里重新 throw**
+- discover 模式下结果为 0 条不算失败，正常回调返回
+- mode=scrape 时单个结果页面抓取失败有内部 try-catch，写入 error 字段继续
+- 整体流程致命失败（DDG 页面打不开等）→ 记录 ERROR 日志 → 重新包装错误后抛出 → **向上抛错**，整组保留重试
+
+#### (11) flag - 断点/暂停标记
 
 触发 EventEmitter 的 `'flag'` 事件，用于编辑器模式下的断点暂停、步进调试。
+
+**失败语义**：Promise 包装，无 try-catch
+- EventEmitter emit 抛异常则 Promise reject → **向上抛错**，整组保留重试
 
 ---
 
@@ -344,17 +406,25 @@ try {
 - **推进语义**：当前 step 跳过，继续同 Pair 内的下一个 step
 - **整组影响**：**不**导致整组动作失败
 
-#### 小结：原生动作失败与整组移除的关系
+#### 小结：动作失败与整组移除的关系（总览）
 
-| 动作 | 失败后是否抛异常 | 当前 step 处理 | 同 Pair 后续 step | 整组何时被移除 |
-|------|----------------|-------------|----------------|-------------|
-| goto | 否（吞掉） | 跳过 | 继续执行 | 正常移除 |
-| click | 否（最终 continue） | 跳过 | 继续执行 | 正常移除 |
-| waitForLoadState | **是（降级后再失败时）** | 终止 carryOutSteps | 不再执行 | **整组不移除，下轮重试** |
-| 其他原生动作 | 否（continue） | 跳过 | 继续执行 | 正常移除 |
-| 自定义 wawActions | **是** | 终止 carryOutSteps | 不再执行 | **整组不移除，下轮重试** |
+| 动作 | 失败后是否抛异常 | 当前 step 处理 | 同 Pair 后续 step | 整组是否移除 |
+|------|----------------|-------------|----------------|------------|
+| goto | 否（吞掉） | 跳过 | 继续执行 | ✅ 正常移除 |
+| click（两次都失败） | 否（continue） | 跳过 | 继续执行 | ✅ 正常移除 |
+| waitForLoadState（降级后再失败） | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
+| 其他原生动作 | 否（continue） | 跳过 | 继续执行 | ✅ 正常移除 |
+| **scrapeList** | **否（catch 吞掉）** | 写空数组 `[]` | 不再执行 | ✅ 正常移除 |
+| **scrapeSchema**（editor 模式） | **否（early return）** | 写空对象 `{}` | 不再执行 | ✅ 正常移除 |
+| scrapeSchema（非 editor） | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
+| scrape/scrapeListAuto/screenshot/scroll | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
+| enqueueLinks（主流程失败） | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
+| flag | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
+| script/crawl/search | **是（catch 后 re-throw）** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
 
 > **整组动作（WhereWhatPair）被移除的唯一条件**：`carryOutSteps()` 正常 return（没有抛出异常），此时 runLoop 会执行 `workflowCopy.splice(actionId, 1)`。
+>
+> **自定义动作的"异类"**：scrapeList（外层 try-catch 吞掉 + 写空数组）和 scrapeSchema（editor 模式 early return）是仅有的两个失败后整组仍会被移除的自定义动作。
 
 ---
 
@@ -389,19 +459,29 @@ runLoop 主循环 (while true)
 
 ---
 
-### 4.2 carryOutSteps 内部：step 失败的五种命运
+### 4.2 carryOutSteps 内部：step 失败的逐类命运
 
 `carryOutSteps()` 用 `for (const step of steps)` 顺序执行每个 step，不同动作失败后的行为差异很大：
 
 ```
 for (const step of steps) {
     │
-    ├─ 分支 A: 是自定义 wawActions (scrape/scrapeList/...)
+    ├─ 分支 A: 是自定义 wawActions
     │   │
-    │   └─ 直接 await wawActions[...]()
-    │      │
-    │      ├─ 成功 → 继续下一个 step
-    │      └─ 失败 → 异常直接抛出 → 终止 carryOutSteps → 回到 runLoop 的 catch
+    │   ├─ (A1) scrapeList → 外层 try-catch 吞掉 → 写空数组 [] 回调 → 正常 return
+    │   │
+    │   ├─ (A2) scrapeSchema (editor模式) → early return, 写空 {} 回调 → 正常 return
+    │   │
+    │   ├─ (A3) scrapeSchema (非editor) / scrape / scrapeListAuto / screenshot / scroll
+    │   │   └─ 无 try-catch → 任何一步失败直接抛 → 终止 carryOutSteps
+    │   │
+    │   ├─ (A4) enqueueLinks → 主流程无 try-catch → 提取链接/关闭页面失败直接抛
+    │   │   └─ (内部并发链接任务有独立 try-catch 隔离，不影响外层)
+    │   │
+    │   ├─ (A5) flag → Promise 包装，emit 抛异常则 reject → 终止 carryOutSteps
+    │   │
+    │   └─ (A6) script / crawl / search → 外层 try-catch 但内部重新 throw
+    │       └─ 失败 → 记录日志 → 包装 Error 后抛出 → 终止 carryOutSteps
     │
     └─ 分支 B: 是 Playwright 原生动作 (page.xxx)
         │
@@ -429,13 +509,33 @@ for (const step of steps) {
 
 #### 失败命运对照表（严格对照代码事实）
 
-| 动作类型 | 失败后是否抛异常 | 当前 step | 同 Pair 后续 step | 整组是否移除 | 最终结局 |
-|---------|----------------|---------|----------------|------------|---------|
-| 自定义 wawActions | **是** | 终止 | 不再执行 | **否** | 下一轮循环整组重试 |
-| waitForLoadState（降级后再失败） | **是** | 终止 | 不再执行 | **否** | 下一轮循环整组重试 |
-| goto | 否（吞掉） | 跳过 | 继续执行 | 是 | 整组正常完成 |
-| click（两次都失败） | 否（continue） | 跳过 | 继续执行 | 是 | 整组正常完成 |
-| 其他原生动作 | 否（continue） | 跳过 | 继续执行 | 是 | 整组正常完成 |
+**A. 原生 Playwright 动作：**
+
+| 动作 | 失败后是否抛异常 | 当前 step | 同 Pair 后续 step | 整组是否移除 | 最终结局 |
+|------|----------------|---------|----------------|------------|---------|
+| goto | 否（吞掉） | 跳过 | 继续执行 | ✅ 是 | 整组正常完成 |
+| click（两次都失败） | 否（continue） | 跳过 | 继续执行 | ✅ 是 | 整组正常完成 |
+| waitForLoadState（降级后再失败） | **是** | 终止 | 不再执行 | ❌ 否 | 下一轮循环整组重试 |
+| 其他原生动作（type/fill/...） | 否（continue） | 跳过 | 继续执行 | ✅ 是 | 整组正常完成 |
+
+**B. 自定义 wawActions（逐类细分）：**
+
+| 动作 | try-catch | 失败行为 | 整组是否移除 | 最终结局 |
+|------|-----------|---------|------------|---------|
+| **scrapeList** | 外层完整 try-catch | 写空数组 `[]`，回调，**正常 return** | ✅ 是 | 整组正常完成 |
+| **scrapeSchema**（editor 模式） | 无 try-catch，但 early return | 写空对象 `{}`，回调 return | ✅ 是 | 整组正常完成 |
+| scrapeSchema（非 editor） | 无 try-catch | **直接抛** | ❌ 否 | 下一轮整组重试 |
+| scrape | 无 try-catch | **直接抛** | ❌ 否 | 下一轮整组重试 |
+| scrapeListAuto | 无 try-catch | **直接抛** | ❌ 否 | 下一轮整组重试 |
+| screenshot | 无 try-catch | **直接抛** | ❌ 否 | 下一轮整组重试 |
+| scroll | 无 try-catch | **直接抛** | ❌ 否 | 下一轮整组重试 |
+| enqueueLinks | 主流程无 / 内部并发有 | 主流程失败时**直接抛** | ❌ 否 | 下一轮整组重试 |
+| flag | 无 try-catch | **直接抛**（Promise reject） | ❌ 否 | 下一轮整组重试 |
+| **script** | 有，但 catch 内 re-throw | 重新包装错误后**抛** | ❌ 否 | 下一轮整组重试 |
+| **crawl** | 有，但 catch 内 re-throw | 重新包装错误后**抛** | ❌ 否 | 下一轮整组重试 |
+| **search** | 有，但 catch 内 re-throw | 重新包装错误后**抛** | ❌ 否 | 下一轮整组重试 |
+
+> **scrapeList 是自定义动作中唯一"吞掉异常 + 写空结果正常返回"的动作**。它的设计意图是：即使抓取失败，也不要中断工作流，把空结果交给上层处理。
 
 ---
 
@@ -506,11 +606,18 @@ if (++loopIterations > MAX_LOOP_ITERATIONS) {  // MAX_LOOP_ITERATIONS = 1000
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ Layer 4: carryOutSteps() 每个 step 的 try-catch               │
-│   - goto: 吞掉 → 继续下一个 step                              │
-│   - waitForLoadState: 先降级重试 → 再失败则向上抛              │
-│   - click: force:true 重试 → 再失败 continue                 │
-│   - 其他原生动作: 失败 → continue 下一个 step                  │
-│   - 自定义 wawActions: 无内部 try-catch → 直接抛出             │
+│   ├─ 原生动作:                                                │
+│   │   ├─ goto: 吞掉 → 继续下一个 step                         │
+│   │   ├─ waitForLoadState: 先降级重试 → 再失败则向上抛         │
+│   │   ├─ click: force:true 重试 → 再失败 continue            │
+│   │   └─ 其他原生: 失败 → continue 下一个 step                │
+│   └─ 自定义 wawActions:                                       │
+│       ├─ scrapeList: 外层 try-catch 吞掉 → 写空数组返回       │
+│       ├─ scrapeSchema (editor): early return 写空 {}          │
+│       ├─ scrapeSchema(非editor)/scrape/.../flag: 无 try-catch │
+│       │   → 失败直接向上抛                                    │
+│       └─ script/crawl/search: try-catch 后 re-throw           │
+│           → 失败包装错误后向上抛                              │
 └──────────────────────┬───────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
