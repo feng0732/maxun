@@ -83,9 +83,9 @@ const DB_SCHEDULER_CLAIM_TIMEOUT_MS = 10 * 60 * 1000;  // 声明超时 10 分钟
 
 调用的是 [scheduler/index.ts L860](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L860) 中的 `handleRunRecording`。
 
-#### 1.2.3 定时调度路径中没有应用层排队！
+#### 1.2.3 定时调度路径中没有应用层排队
 
-**关键发现**：定时调度路径在浏览器槽位不足时**直接失败**，不会进入 queued 状态。
+**关键发现**：定时调度路径没有应用层排队（queued 状态），浏览器槽位不足时错误被层层 catch 吞掉，任务不会排队等待，也不会触发 Graphile Worker 的 `maxAttempts: 6` 重试机制（详见下一节分析）。
 
 **代码证据**：
 - [scheduler/index.ts L74](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L74)：`const browserId = isDocRobot ? uuid() : createRemoteBrowserForRun(userId);`
@@ -207,8 +207,8 @@ const processQueuedRunsInterval = setInterval(async () => {
 |----------|----------|-----------------|
 | Web UI 手动运行 | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1018) | ✅ 有 |
 | Web UI 重试运行 | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/routes/storage.ts#L1188) | ✅ 有（重试从 queued 开始） |
-| 定时调度 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L860) | ❌ 无，槽位不足直接失败 |
-| API / SDK 运行 | [record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/api/record.ts#L552) | ❌ 无，槽位不足直接失败 |
+| 定时调度 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L860) | ❌ 无，槽位不足时错误被吞掉，任务静默失败 |
+| API / SDK 运行 | [record.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/api/record.ts#L552) | ❌ 无，槽位不足时错误被 catch，返回 success: false |
 
 ### 1.4 Graphile Worker 执行队列（Layer 3）
 
@@ -633,7 +633,7 @@ reserveBrowserSlotAtomic 成功?
                  ↓
            ⑥ 函数静默返回 undefined → Graphile Worker 认为任务成功
                  ↓
-           ⚠️  maxAttempts: 6 完全不会触发！任务永久丢失！
+           ⚠️  maxAttempts: 6 完全不会触发！本次调度静默失败，无 Run 记录！
 ```
 
 #### 路径 C：API/SDK 运行（无应用层排队）
@@ -652,11 +652,21 @@ reserveBrowserSlotAtomic 成功?
     │              ↓
     │        readyForRunHandler → 执行工作流 → 完成/失败 → 销毁浏览器
     │
-    └─ 否 → throw Error → catch 返回 {success: false}
+    └─ 否 → ① throw Error('User has reached maximum browser limit')
                  ↓
-           handleRunRecording 拿不到 runId → 再次 throw
+           ② 被 createWorkflowAndStoreMetadata catch → return {success: false}
                  ↓
-           API 返回 500 错误（无重试，无排队）
+           ③ handleRunRecording 解构失败 → runId = undefined
+                 ↓
+           ④ throw new Error('runId or userId is undefined')
+                 ↓
+           ⑤ 被 handleRunRecording 自己的 catch 捕获 → 仅日志，返回 undefined
+                 ↓
+           ⑥ 路由处理函数 if (!runId) → throw Error('Run ID is undefined')
+                 ↓
+           ⑦ 路由 catch → 返回 500 错误
+                 ↓
+           ⚠️  无重试，无排队，但调用者能收到 500 错误
 ```
 
 ### 4.2 排队状态流转全景
@@ -676,11 +686,11 @@ reserveBrowserSlotAtomic 成功?
      有可用槽位                     无可用槽位
           │                           │
           ▼                           ▼
-   reserved 状态              ┌─────────────────────┐
-   (异步初始化中)              │  Web UI: queued 状态 │
-          │                   │  定时/API: 直接失败  │
-          ▼                   └─────────┬───────────┘
-     ready 状态                        │
+   reserved 状态              ┌─────────────────────────┐
+   (异步初始化中)              │  Web UI: queued 状态     │
+          │                   │  定时调度: 错误被吞掉    │
+          ▼                   │  API: 返回 500 错误      │
+     ready 状态               └─────────────┬───────────┘
           │                     [每 5 秒轮询]
           ▼                           │
    Worker 执行                        │
@@ -738,7 +748,7 @@ reserveBrowserSlotAtomic 成功?
 **缺陷 2：三个运行路径行为不一致**
 
 - **问题**：Web UI 手动运行有应用层排队（queued 状态），但定时调度和 API/SDK 运行没有
-- **影响**：浏览器槽位不足时，定时任务直接失败（虽有 Graphile Worker 重试），API 请求直接返回 500
+- **影响**：浏览器槽位不足时，Web UI 路径会排队等待；定时调度路径错误被吞掉，任务静默失败且 `maxAttempts: 6` 完全不生效；API 路径返回 500 错误但无排队
 - **建议**：统一三个路径的行为，要么都实现应用层排队，要么明确文档说明差异
 
 **缺陷 3：两处 BROWSER_INIT_TIMEOUT 同名不同值**
@@ -747,14 +757,14 @@ reserveBrowserSlotAtomic 成功?
 - **问题**：同名变量值不同，容易混淆
 - **建议**：重命名区分含义，如 `BROWSER_SESSION_INIT_TIMEOUT`（45s）和 `WORKER_BROWSER_READY_TIMEOUT`（60s）
 
-**缺陷 4：定时调度失败后 maxAttempts 完全不生效（任务永久丢失）**
+**缺陷 4：定时调度槽位不足时 maxAttempts 完全不生效（静默失败无记录）**
 
 - **位置**：[scheduler/index.ts L903-L908](file:///d:/fz/0601-2/solo-dogfeeding/code/112-maxun/server/src/workflow-management/scheduler/index.ts#L903-L908)
 - **问题**：`SCHEDULED_WORKFLOW` 任务设置 `maxAttempts: 6`，但两处 catch 都"吞掉"了错误（`createWorkflowAndStoreMetadata` catch 返回 `{success: false}` 不重新抛出，`handleRunRecording` catch 仅日志不重新抛出），函数最终返回 `undefined`，Graphile Worker 认为任务成功完成
-- **影响**：浏览器槽位不足时，定时调度任务**永久丢失**，没有重试，没有排队，甚至连失败日志都不会被 Graphile Worker 记录
+- **影响**：浏览器槽位不足时，本次调度**静默失败**——没有 Run 记录、没有重试、Graphile Worker 也不记录失败，用户完全感知不到这次调度曾经发生过
 - **建议**：
   1. 在 `handleRunRecording` 的 catch 块末尾添加 `throw error`，让 Graphile Worker 能感知到失败
-  2. 但即使修复了重新抛出，由于重试间隔太短（指数退避，约 1 分钟内 6 次重试全部失败），仍无法解决问题
+  2. 但即使修复了重新抛出，由于重试间隔太短（指数退避，约 1 分钟内 6 次重试全部失败），仍无法解决槽位不足的问题
   3. **真正的修复**：将定时调度路径也纳入应用层排队（queued 状态），与 Web UI 路径保持一致
 
 ### 5.2 潜在风险
