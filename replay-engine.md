@@ -259,13 +259,17 @@ const scrapeResult = await page.evaluate(
 
 #### (4) scrape - 启发式抓取
 
-**失败语义**：无 try-catch
-- waitForDynamicStability / ensureScriptsLoaded / page.evaluate 任一失败 → **向上抛错**，整组保留重试
+**失败语义**：动作本身无 try-catch，回调有服务端隔离
+- 动作内部失败（waitForDynamicStability / ensureScriptsLoaded / page.evaluate）→ **向上抛错**，整组保留重试
+- 回调失败：Run 模式下 `serializableCallback` 被服务端 try-catch 包裹，reject 被吞掉；Editor 模式下无 try-catch，回调抛错会 **向上抛出**
 
 #### (5) screenshot - 页面截图
 
-**失败语义**：无 try-catch
-- waitForImagesLoaded / page.screenshot / binaryCallback 任一失败 → **向上抛错**，整组保留重试
+**失败语义**：动作本身无 try-catch，但回调有服务端隔离
+- 动作内部失败（waitForImagesLoaded / page.screenshot 抛错）→ **向上抛错**，整组保留重试
+- 回调失败分两种场景：
+  - **Run 模式**：`binaryCallback` 被服务端 try-catch 包裹（`Interpreter.ts` L709-L733），回调 reject 被 catch 吞掉，**不会上抛到 maxun-core**，截图动作正常完成
+  - **Editor 模式**：`binaryCallback` 无 try-catch，`persistBinaryDataToDatabase` 内部有自己的 try-catch 吞掉，正常情况下不会抛出；但如果 `binaryCallback` 函数本身抛错 → 会 reject → **向上抛错**，整组保留重试
 
 #### (6) scroll - 页面滚动
 
@@ -325,10 +329,25 @@ While 队列非空 && 结果数 < limit:
 
 #### (11) flag - 断点/暂停标记
 
-触发 EventEmitter 的 `'flag'` 事件，用于编辑器模式下的断点暂停、步进调试。
+```typescript
+flag: async () => new Promise((res) => {
+  this.emit('flag', page, res);
+}),
+```
 
-**失败语义**：Promise 包装，无 try-catch
-- EventEmitter emit 抛异常则 Promise reject → **向上抛错**，整组保留重试
+**核心机制**：flag 返回一个 **等待 `resume()` 调用才 resolve 的 Promise**，而非抛错。
+执行流程：
+1. maxun-core 内 `this.emit('flag', page, res)` 将 `res`（resolve 函数）传给服务端
+2. 服务端 `Interpreter.ts` 监听 `'flag'` 事件：
+   - **非暂停状态** → 直接调用 `resume()` → Promise resolve → 动作正常完成
+   - **暂停状态**（命中断点或用户点暂停） → 将 `resume` 存入 `interpretationResume`，等待用户操作
+3. 用户通过 socket 发送 `resume` / `step` 事件 → 调用 `interpretationResume()` → Promise resolve
+
+**失败语义**：
+- 正常情况：Promise 永远不会 reject，只是**停住等待**，不抛错，不触发整组重试
+- 唯一可能出问题的场景：`this.emit('flag', ...)` 如果没有监听器且 EventEmitter 设置了 `captureRejectionSymbol`，或 `interpretationResume` 被设为 `null` 后又被调用
+- 实际上：服务端在 `interpretRecordingInEditor` / `InterpretRecording` 中都注册了 `'flag'` 监听器，所以 emit 不会抛错
+- **结论**：flag 动作的语义是"暂停等待"，不是"失败抛错"，整组会正常移除
 
 ---
 
@@ -419,12 +438,12 @@ try {
 | scrapeSchema（非 editor） | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
 | scrape/scrapeListAuto/screenshot/scroll | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
 | enqueueLinks（主流程失败） | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
-| flag | **是** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
+| flag | **否（暂停等 resume）** | 暂停后继续 | resume 后继续 | ✅ 正常移除 |
 | script/crawl/search | **是（catch 后 re-throw）** | 终止 carryOutSteps | 不再执行 | ❌ 整组保留重试 |
 
 > **整组动作（WhereWhatPair）被移除的唯一条件**：`carryOutSteps()` 正常 return（没有抛出异常），此时 runLoop 会执行 `workflowCopy.splice(actionId, 1)`。
 >
-> **自定义动作的"异类"**：scrapeList（外层 try-catch 吞掉 + 写空数组）和 scrapeSchema（editor 模式 early return）是仅有的两个失败后整组仍会被移除的自定义动作。
+> **不会触发整组重试的自定义动作**：scrapeList（外层 try-catch 吞掉 + 写空数组）、scrapeSchema（editor 模式 early return）、flag（暂停等待 resume，不抛错）。其余自定义动作失败后整组保留重试。
 
 ---
 
@@ -478,7 +497,8 @@ for (const step of steps) {
     │   ├─ (A4) enqueueLinks → 主流程无 try-catch → 提取链接/关闭页面失败直接抛
     │   │   └─ (内部并发链接任务有独立 try-catch 隔离，不影响外层)
     │   │
-    │   ├─ (A5) flag → Promise 包装，emit 抛异常则 reject → 终止 carryOutSteps
+    │   ├─ (A5) flag → Promise 等待 resume() → 暂停不抛错 → resume 后正常 resolve
+    │   │   └─ (几乎不会失败，除非 emit 无监听器)
     │   │
     │   └─ (A6) script / crawl / search → 外层 try-catch 但内部重新 throw
     │       └─ 失败 → 记录日志 → 包装 Error 后抛出 → 终止 carryOutSteps
@@ -614,8 +634,9 @@ if (++loopIterations > MAX_LOOP_ITERATIONS) {  // MAX_LOOP_ITERATIONS = 1000
 │   └─ 自定义 wawActions:                                       │
 │       ├─ scrapeList: 外层 try-catch 吞掉 → 写空数组返回       │
 │       ├─ scrapeSchema (editor): early return 写空 {}          │
-│       ├─ scrapeSchema(非editor)/scrape/.../flag: 无 try-catch │
+│       ├─ scrapeSchema(非editor)/scrape/.../scroll: 无 try-catch │
 │       │   → 失败直接向上抛                                    │
+│       ├─ flag: Promise 等 resume → 暂停不抛错，正常 resolve    │
 │       └─ script/crawl/search: try-catch 后 re-throw           │
 │           → 失败包装错误后向上抛                              │
 └──────────────────────┬───────────────────────────────────────┘
