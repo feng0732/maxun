@@ -501,39 +501,40 @@ Webhook 发送失败时采用指数退避重试：
 │  创建 Run   │  →  数据库：Run 记录（status=running, 空输出）
 └─────────────┘
     │
-    ▼
-┌─────────────┐
-│ 工作流执行  │  ← maxun-core Interpreter
-└─────────────┘
-    │
-    ├─→ serializableCallback ─→ 内存：serializableDataByType
-    │                                    │
-    │                                    └─→ persistenceBuffer ──批量──→ 数据库：serializableOutput
-    │
-    └─→ binaryCallback ───────→ 内存：binaryData
-                                       │
-                                       └──────────────实时──────────────→ 数据库：binaryOutput
-    │
-    ▼
-┌─────────────┐
-│  执行完成   │
-└─────────────┘
-    │
-    ▼
-┌─────────────┐
-│ 格式后处理  │  →  crawl/search 类型的格式转换
-└─────────────┘
-    │
-    ▼
-┌─────────────┐
-│ MinIO 上传  │  →  二进制数据 → 对象存储，URL 写回数据库
-└─────────────┘
-    │
-    ▼
-┌─────────────┐
-│ 集成导出    │  ──→ Google Sheets
-└─────────────┘  ──→ Airtable
-                 ──→ Webhook
+    ├─────────────────────────────────────────────────────────────────┐
+    │ scrape 分支                                                     │ 非 scrape 分支
+    ▼                                                                 ▼
+┌──────────────────┐                                  ┌─────────────┐
+│ 直接格式转换      │                                  │ 工作流执行   │  ← maxun-core Interpreter
+│ convertPageTo*() │                                  └─────────────┘
+└──────────────────┘                                       │
+    │                                                 ├─→ serializableCallback → persistenceBuffer → 批量写库
+    │                                                 └─→ binaryCallback → 实时写库
+    ▼                                                      │
+┌──────────────────┐                                      ▼
+│ 一次性写库        │                              ┌─────────────┐
+│ serializableOutput│                              │  执行完成    │
+│ + binaryOutput    │                              └─────────────┘
+└──────────────────┘                                      │
+    │                                                     ▼
+    ▼                                              ┌─────────────┐
+┌──────────────────┐                               │ 格式后处理   │  →  crawl/search 类型
+│ MinIO 上传       │                               └─────────────┘
+└──────────────────┘                                      │
+    │                                                     ▼
+    ▼                                              ┌─────────────┐
+┌──────────────────┐                               │ MinIO 上传   │  →  URL 写回数据库
+│ Webhook          │  ← 仅 Webhook，无集成导出      └─────────────┘
+└──────────────────┘                                      │
+    │                                                     ▼
+    ▼                                              ┌─────────────┐
+  结束                                              │ Webhook      │
+                                                    └─────────────┘
+                                                          │
+                                                          ▼
+                                                    ┌─────────────┐
+                                                    │ 集成导出     │  ──→ Google Sheets
+                                                    └─────────────┘  ──→ Airtable
 ```
 
 ---
@@ -616,6 +617,8 @@ Webhook 发送失败时采用指数退避重试：
 | **格式转换入口** | 直接调用 `convertPageToMarkdown/HTML/Text/Links/Screenshot()` | InterpretRecording → `processRobotOutputFormats()`（仅 crawl/search） |
 | **截图获取方式** | `convertPageToScreenshot(url, page, fullPage)` 直接生成 | InterpretRecording 的 `binaryCallback` 回调收集 |
 | **Interpreter.setRunId()** | ❌ 不调用 | ✅ 调用，用于实时持久化绑定 |
+| **Google Sheets / Airtable 集成导出** | ❌ **不触发**，scrape 分支在 Webhook 后直接 return | ✅ **触发**，调用 `triggerIntegrationUpdates()` |
+| **Webhook** | ✅ 触发 | ✅ 触发 |
 | **输出格式** | markdown/html/text/links/screenshot-visible/screenshot-fullpage/summary/promptResult | scrapeSchema/scrapeList/crawl/search + 后处理派生格式 |
 
 #### 差异详解：格式转换
@@ -697,13 +700,20 @@ if (robotType === 'crawl' || robotType === 'search') {
 
 **关键区别**：scrape 的截图数据 **从未进入 Interpreter 的内存数据结构**，完全在 executeRun 函数内局部变量中流转；非 scrape 的截图在 Interpreter 内部产生，通过回调实时写入数据库。
 
-#### 差异详解：集成导出
+#### 差异详解：集成导出（Google Sheets / Airtable）
 
-scrape 和非 scrape 的集成导出逻辑 **完全相同**，都调用同一个 `triggerIntegrationUpdates()` 函数：
-1. scrape：格式转换全部完成后调用
-2. 非 scrape：InterpretRecording + 格式后处理全部完成后调用
+> **重要修正**：scrape 分支 **不触发** Google Sheets 和 Airtable 集成导出，只有非 scrape 分支才调用 `triggerIntegrationUpdates()`。
 
-该函数内部逻辑：
+**scrape 分支**：格式转换 → 截图上传 MinIO → Socket 通知 → **sendWebhook()** → `return` 结束，**不调用** `triggerIntegrationUpdates()`。
+
+代码证据（三套执行层一致）：
+- [record.ts#L1017-L1045](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/api/record.ts#L1017-L1045)：scrape 分支在 `sendWebhook` + `capture` + `destroyRemoteBrowser` 后直接 `return`，后续的 `triggerIntegrationUpdates`（line 1308）属于非 scrape 分支
+- [scheduler/index.ts#L492-L515](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/workflow-management/scheduler/index.ts#L492-L515)：同理，scrape 分支 `return true` 后，`triggerIntegrationUpdates`（line 755）属于非 scrape 分支
+- [task-runner.ts#L358-L365](file:///d:/fz/0601-2/solo-dogfeeding/code/113-maxun/server/src/task-runner.ts#L358-L365)：同理，scrape 分支 `return` 后，`triggerIntegrationUpdates`（line 508）属于非 scrape 分支
+
+**非 scrape 分支**：InterpretRecording → 格式后处理 → 截图上传 MinIO → Socket 通知 → sendWebhook() → **triggerIntegrationUpdates()** → 结束
+
+`triggerIntegrationUpdates()` 内部逻辑：
 ```typescript
 addGoogleSheetUpdateTask(runId, { robotId, runId, status: 'pending', retries: 5 });
 addAirtableUpdateTask(runId, { robotId, runId, status: 'pending', retries: 5 });
@@ -789,25 +799,41 @@ scrape:
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │                          执行层（三套重复代码）                                    │
 │                                                                                  │
-│  if (type === 'scrape') {                  if (type !== 'scrape') {              │
-│    // 直接格式转换                                // InterpretRecording           │
-│    convertPageToMarkdown()                       browser.interpreter.setRunId()  │
-│    convertPageToHTML()                            browser.interpreter.           │
-│    convertPageToText()                              InterpretRecording()         │
-│    convertPageToLinks()                           // 内部批量实时写库             │
-│    convertPageToScreenshot()                      ↓                             │
-│    summarizeMarkdown()                        crawl/search:                     │
-│    executeBrowserAgent()                        processRobotOutputFormats()     │
-│  }                                            }                                  │
-│        │                                                                         │
-│        ▼                                                                         │
-│  BinaryOutputService.uploadAndStoreBinaryOutput() → MinIO                        │
-│        │                                                                         │
-│        ▼                                                                         │
-│  sendWebhook() → 外部 Webhook URL                                                │
-│        │                                                                         │
-│        ▼                                                                         │
-│  triggerIntegrationUpdates() → Google Sheets + Airtable                         │
+│  ┌─────────── scrape 分支（提前 return）──────────────┐                          │
+│  │  convertPageToMarkdown/HTML/Text/Links/Screenshot  │                          │
+│  │  summarizeMarkdown / executeBrowserAgent            │                          │
+│  │           ↓                                        │                          │
+│  │  run.update(所有输出一次性写库)                      │                          │
+│  │           ↓                                        │                          │
+│  │  BinaryOutputService → MinIO 截图上传              │                          │
+│  │           ↓                                        │                          │
+│  │  Socket 通知 run-completed                         │                          │
+│  │           ↓                                        │                          │
+│  │  sendWebhook() → 外部 Webhook URL                  │                          │
+│  │           ↓                                        │                          │
+│  │  capture(telemetry) → destroyRemoteBrowser         │                          │
+│  │           ↓                                        │                          │
+│  │  return ← 到此结束，不触发集成导出                   │                          │
+│  └────────────────────────────────────────────────────┘                          │
+│                                                                                  │
+│  ┌──────── 非 scrape 分支 ────────┐                                               │
+│  │  interpreter.setRunId()         │                                               │
+│  │           ↓                    │                                               │
+│  │  InterpretRecording()          │  ← 执行中实时批量写库                         │
+│  │           ↓                    │                                               │
+│  │  crawl/search:                 │                                               │
+│  │    processRobotOutputFormats() │                                               │
+│  │           ↓                    │                                               │
+│  │  BinaryOutputService → MinIO   │                                               │
+│  │           ↓                    │                                               │
+│  │  Socket 通知 run-completed     │                                               │
+│  │           ↓                    │                                               │
+│  │  sendWebhook()                 │                                               │
+│  │           ↓                    │                                               │
+│  │  triggerIntegrationUpdates()   │  → Google Sheets + Airtable                  │
+│  │           ↓                    │                                               │
+│  │  destroyRemoteBrowser          │                                               │
+│  └────────────────────────────────┘                                               │
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -821,6 +847,8 @@ scrape:
 | **经过批量持久化缓冲区** | ❌ | ✅ | ✅ | ✅ |
 | **实时写库** | ❌（一次性） | ✅ | ✅ | ✅ |
 | **调用 processRobotOutputFormats** | ❌ | ❌ | ✅ | ✅ |
+| **触发 Google Sheets / Airtable 集成导出** | ❌ **不触发** | ✅ | ✅ | ✅ |
+| **触发 Webhook** | ✅ | ✅ | ✅ | ✅ |
 | **输出到 serializableOutput 的 key** | markdown/html/text/links/summary/promptResult/scrape | scrapeSchema/scrapeList | crawl + 派生的 markdown/html/text/links/summary | search + 派生的 markdown/html/text/links/summary |
 | **截图数据来源** | convertPageToScreenshot() | binaryCallback | binaryCallback + 后处理新增 | binaryCallback + 后处理新增 |
 | **setRunId() 调用** | ❌ | ✅ | ✅ | ✅ |
