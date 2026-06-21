@@ -13,7 +13,7 @@
 
 ## 二、核心文件索引
 
-> 代码引用格式：`相对路径` + 行号范围，括号内为绝对路径链接
+> 代码引用格式：`相对路径` + 行号（L 前缀），如 `server/src/foo.ts` L12-L15
 
 ### 后端
 
@@ -49,7 +49,7 @@
 
 ### 命名空间创建流程
 
-**1. 后端创建命名空间** —— `server/src/browser-management/controller.ts` [L28-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/controller.ts#L28-L29)
+**1. 后端创建命名空间** —— `server/src/browser-management/controller.ts` L28-L29
 
 ```typescript
 createSocketConnection(
@@ -59,7 +59,7 @@ createSocketConnection(
 );
 ```
 
-**2. 前端连接命名空间** —— `src/context/socket.tsx` [L38-L42](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/context/socket.tsx#L38-L42)
+**2. 前端连接命名空间** —— `src/context/socket.tsx` L38-L42
 
 ```typescript
 const socket = io(`${SERVER_ENDPOINT}/${id}`, {
@@ -68,7 +68,7 @@ const socket = io(`${SERVER_ENDPOINT}/${id}`, {
 });
 ```
 
-**3. 连接建立回调** —— `server/src/socket-connection/connection.ts` [L17-L26](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/socket-connection/connection.ts#L17-L26)
+**3. 连接建立回调** —— `server/src/socket-connection/connection.ts` L17-L26
 
 - 注册输入处理器 `registerInputHandlers(socket, userId)`
 - 注册断开连接清理 `removeInputHandlers(socket)`
@@ -109,25 +109,25 @@ const socket = io(`${SERVER_ENDPOINT}/${id}`, {
 ```
 
 **关键代码**：
-- 启动入口：`server/src/routes/record.ts` [L37-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/routes/record.ts#L37-L49)
-- 浏览器初始化：`server/src/browser-management/controller.ts` [L26-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/controller.ts#L26-L103)
-- rrweb 录制初始化：`server/src/browser-management/classes/RemoteBrowser.ts` [L321-L418](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L321-L418)
+- 启动入口：`server/src/routes/record.ts` L37-L49
+- 浏览器初始化：`server/src/browser-management/controller.ts` L26-L103
+- rrweb 录制初始化：`server/src/browser-management/classes/RemoteBrowser.ts` L321-L418
 
 ### 4.2 会话超时机制
 
 录制会话默认超时时间为 **10 分钟**（`RECORDING_TIMEOUT_MS`）。
 
-- 超时设置：`server/src/browser-management/controller.ts` [L14-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/controller.ts#L14-L15)
-- 超时触发：`server/src/browser-management/controller.ts` [L58-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/controller.ts#L58-L71)
+- 超时设置：`server/src/browser-management/controller.ts` L14-L15
+- 超时触发：`server/src/browser-management/controller.ts` L58-L71
   - 向前端发送 `recording-timeout` 事件
   - 等待 1 秒让前端处理
   - 调用 `destroyRemoteBrowser()` 销毁浏览器
 
-前端超时处理：`src/pages/RecordingPage.tsx` [L50-L70](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/pages/RecordingPage.tsx#L50-L70)
+前端超时处理：`src/pages/RecordingPage.tsx` L50-L70
 
 ### 4.3 会话销毁流程
 
-销毁入口：`server/src/browser-management/controller.ts` [L155-L233](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/controller.ts#L155-L233)
+销毁入口：`server/src/browser-management/controller.ts` L155-L233
 
 1. 清除录制超时定时器
 2. 关闭浏览器页面、上下文、浏览器实例
@@ -159,7 +159,7 @@ const socket = io(`${SERVER_ENDPOINT}/${id}`, {
 
 #### ① 前端单向通知
 
-触发位置：`src/components/recorder/DOMBrowserRenderer.tsx` [L883-L884](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L883-L884)
+触发位置：`src/components/recorder/DOMBrowserRenderer.tsx` L883-L884
 
 ```typescript
 socket.on('rrweb-event', handleRRWebEvent);
@@ -186,7 +186,7 @@ socket.emit('request-refresh');   // ← 发出事件，但后端没有任何 .o
 
 #### ① 前端单向通知
 
-触发位置：`src/components/recorder/RightSidePanel.tsx` [L819-L824](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/RightSidePanel.tsx#L819-L824)
+触发位置：`src/components/recorder/RightSidePanel.tsx` L819-L824
 
 ```typescript
 const screenshotSettings = {
@@ -199,11 +199,11 @@ addScreenshotStep(fullPage, currentScreenshotActionId);  // 乐观更新本地�
 ```
 
 **同时做的本地状态变更**（乐观 UI 更新）：
-- `addScreenshotStep()` 在 `src/context/browserSteps.tsx` [L378-L382](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/context/browserSteps.tsx#L378-L382) 本地添加一个截图步骤（此时还没有截图数据）
+- `addScreenshotStep()` 在 `src/context/browserSteps.tsx` L378-L382 本地添加一个截图步骤（此时还没有截图数据）
 
 #### ② 后端监听处理
 
-监听位置：`server/src/browser-management/classes/RemoteBrowser.ts` [L699-L701](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L699-L701)
+监听位置：`server/src/browser-management/classes/RemoteBrowser.ts` L699-L701
 
 ```typescript
 this.socket.on("captureDirectScreenshot", async (settings) => {
@@ -211,7 +211,7 @@ this.socket.on("captureDirectScreenshot", async (settings) => {
 });
 ```
 
-实际处理函数：`server/src/browser-management/classes/RemoteBrowser.ts` [L619-L668](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L619-L668)
+实际处理函数：`server/src/browser-management/classes/RemoteBrowser.ts` L619-L668
 
 处理逻辑：
 1. 检查 `this.currentPage` 是否存在
@@ -224,12 +224,12 @@ this.socket.on("captureDirectScreenshot", async (settings) => {
 
 | 事件 | 触发条件 | 推送位置 | 数据 |
 |------|---------|---------|------|
-| `screenshotCaptureStarted` | 截图开始前 | [L637-L640](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L637-L640) | `{ userId, fullPage }` |
-| `directScreenshotCaptured` | 截图成功 | [L655-L661](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L655-L661) | `{ userId, screenshot (dataURL), mimeType, fullPage, timestamp }` |
-| `screenshotError` | 无页面或截图异常 | [L629-L632](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L629-L632)、[L664-L667](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L664-L667) | `{ userId, error }` |
+| `screenshotCaptureStarted` | 截图开始前 | `server/src/browser-management/classes/RemoteBrowser.ts` L637-L640 | `{ userId, fullPage }` |
+| `directScreenshotCaptured` | 截图成功 | `server/src/browser-management/classes/RemoteBrowser.ts` L655-L661 | `{ userId, screenshot (dataURL), mimeType, fullPage, timestamp }` |
+| `screenshotError` | 无页面或截图异常 | `server/src/browser-management/classes/RemoteBrowser.ts` L629-L632、L664-L667 | `{ userId, error }` |
 
 **前端接收**（只处理成功分支）：
-- 监听 `directScreenshotCaptured`：`src/components/recorder/RightSidePanel.tsx` [L226-L247](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/RightSidePanel.tsx#L226-L247)
+- 监听 `directScreenshotCaptured`：`src/components/recorder/RightSidePanel.tsx` L226-L247
   - `updateScreenshotStepData(step.id, data.screenshot)` —— 将 base64 截图数据填入本地步骤
   - `emitActionForStep(step)` —— 发送 `action` 事件让后端生成 screenshot 工作流动作
 
@@ -271,7 +271,7 @@ this.socket.on("captureDirectScreenshot", async (settings) => {
 
 #### ① 前端单向通知
 
-触发位置：`src/components/recorder/SaveRecording.tsx` [L105-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/SaveRecording.tsx#L105-L127)
+触发位置：`src/components/recorder/SaveRecording.tsx` L105-L127
 
 ```typescript
 const payload = {
@@ -289,7 +289,7 @@ setWaitingForSave(true);   // 本地设置等待状态
 
 #### ② 后端监听处理
 
-监听位置：`server/src/workflow-management/classes/Generator.ts` [L221-L225](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L221-L225)
+监听位置：`server/src/workflow-management/classes/Generator.ts` L221-L225
 
 ```typescript
 socket.on('save', (data) => {
@@ -298,12 +298,12 @@ socket.on('save', (data) => {
 });
 ```
 
-实际处理函数 `saveNewWorkflow`：`server/src/workflow-management/classes/Generator.ts` [L1059-L1128](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1059-L1128)
+实际处理函数 `saveNewWorkflow`：`server/src/workflow-management/classes/Generator.ts` L1059-L1128
 
 **录制状态变更**（后端 Generator 内部）：
 1. **文件名校验**：空文件名 → 直接返回错误
 2. **重名检查**：查询 Robot 表，检查该用户是否已有同名机器人
-3. **工作流优化**（核心状态变更）：调用 `this.optimizeWorkflow(this.workflowRecord)` —— `src/workflow-management/classes/Generator.ts` [L1417-L1518](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1417-L1518)
+3. **工作流优化**（核心状态变更）：调用 `this.optimizeWorkflow(this.workflowRecord)` —— `server/src/workflow-management/classes/Generator.ts` L1417-L1518
    - 将连续的 `press` 动作合并为 `type` 动作
    - 处理 Backspace、Delete 对按键缓冲的影响
 4. **写入数据库**：创建或更新 Robot 记录（含 `recording_meta` 和 `workflow` JSON）
@@ -313,14 +313,14 @@ socket.on('save', (data) => {
 
 | 事件 `fileSaved` 的 actionType | 触发条件 | 推送位置 |
 |--------------------------------|---------|---------|
-| `'error'` | 文件名为空 | [L1077](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1077) |
-| `'nameExists'` | 该用户已有同名机器人 | [L1087](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1087)、[L1120](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1120)（数据库唯一约束冲突兜底） |
-| `'saved'` | 新建机器人成功（无 retrainRobotId） | [L1127](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1127) |
-| `'retrained'` | 重新训练已有机器人成功（有 retrainRobotId） | [L1127](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1127) |
+| `'error'` | 文件名为空 | `server/src/workflow-management/classes/Generator.ts` L1077 |
+| `'nameExists'` | 该用户已有同名机器人 | `server/src/workflow-management/classes/Generator.ts` L1087、L1120（数据库唯一约束冲突兜底） |
+| `'saved'` | 新建机器人成功（无 retrainRobotId） | `server/src/workflow-management/classes/Generator.ts` L1127 |
+| `'retrained'` | 重新训练已有机器人成功（有 retrainRobotId） | `server/src/workflow-management/classes/Generator.ts` L1127 |
 
 **前端接收**：
-- 监听位置：`src/components/recorder/SaveRecording.tsx` [L138-L143](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/SaveRecording.tsx#L138-L143)
-- 处理函数 `handleFileSaved`：[L129-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/SaveRecording.tsx#L129-L136)
+- 监听位置：`src/components/recorder/SaveRecording.tsx` L138-L143
+- 处理函数 `handleFileSaved`：`src/components/recorder/SaveRecording.tsx` L129-L136
   - `'nameExists'` → 显示错误提示，`setWaitingForSave(false)` 继续留在页面
   - 其他 → 调用 `exitRecording()`：调 `stopRecording` REST API 销毁浏览器、`setBrowserId(null)`、关闭窗口
 
@@ -332,7 +332,7 @@ socket.on('save', (data) => {
 
 #### ③ 状态变更与推送（后端 → 前端）
 
-**推送触发点**：`server/src/workflow-management/classes/Generator.ts` [L342](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L342)
+**推送触发点**：`server/src/workflow-management/classes/Generator.ts` L342
 
 ```typescript
 this.socket.emit('workflow', this.workflowRecord);
@@ -357,7 +357,7 @@ this.socket.emit('workflow', this.workflowRecord);
 | 删除动作 | `onRemoveAction` → `generator.removeAction` → 直接 emit |
 | 直接 screenshot 步骤完成 | `RightSidePanel.emitActionForStep` → `socket.emit('action')` → 同上自定义动作 |
 
-`addPairToWorkflowAndNotifyClient` 实现：`server/src/workflow-management/classes/Generator.ts` [L270-L344](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L270-L344)
+`addPairToWorkflowAndNotifyClient` 实现：`server/src/workflow-management/classes/Generator.ts` L270-L344
 
 其内部的 **录制状态变更** 包括：
 1. 根据 URL 和 selectors 判断是否与已有 workflow pair 合并（同页操作追加到同一个 what 数组）
@@ -368,7 +368,7 @@ this.socket.emit('workflow', this.workflowRecord);
 
 #### 前端接收
 
-监听位置：`src/components/recorder/RightSidePanel.tsx` [L162-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/RightSidePanel.tsx#L162-L178)
+监听位置：`src/components/recorder/RightSidePanel.tsx` L162-L178
 
 ```typescript
 useEffect(() => {
@@ -379,7 +379,7 @@ useEffect(() => {
 }, [id, socket, workflowHandler]);
 ```
 
-处理函数 `workflowHandler`：[L75-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/RightSidePanel.tsx#L75-L77)
+处理函数 `workflowHandler`：`src/components/recorder/RightSidePanel.tsx` L75-L77
 
 ```typescript
 const workflowHandler = useCallback((data: WorkflowFile) => {
@@ -437,9 +437,9 @@ rrweb Replayer 渲染 DOM 到 iframe
 ```
 
 **关键代码**：
-- 后端注入 rrweb：`server/src/browser-management/classes/RemoteBrowser.ts` [L321-L418](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L321-L418)
-- 后端暴露桥接函数：`server/src/browser-management/classes/RemoteBrowser.ts` [L356-L364](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L356-L364)
-- 前端接收渲染：`src/components/recorder/DOMBrowserRenderer.tsx` [L808-L889](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L808-L889)
+- 后端注入 rrweb：`server/src/browser-management/classes/RemoteBrowser.ts` L321-L418
+- 后端暴露桥接函数：`server/src/browser-management/classes/RemoteBrowser.ts` L356-L364
+- 前端接收渲染：`src/components/recorder/DOMBrowserRenderer.tsx` L808-L889
 
 ### 7.2 点击操作流
 
@@ -470,8 +470,8 @@ socket.emit('dom:click', { selector, elementInfo, coordinates, ... })
 ```
 
 **关键代码**：
-- 前端点击处理：`src/components/recorder/DOMBrowserRenderer.tsx` [L367-L588](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/components/recorder/DOMBrowserRenderer.tsx#L367-L588)
-- 后端点击处理：`server/src/browser-management/inputHandlers.ts` [L445-L585](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/inputHandlers.ts#L445-L585)
+- 前端点击处理：`src/components/recorder/DOMBrowserRenderer.tsx` L367-L588
+- 后端点击处理：`server/src/browser-management/inputHandlers.ts` L445-L585
 
 ### 7.3 自定义动作流（抓取/截图）
 
@@ -497,8 +497,8 @@ generator.customAction(action, actionId, settings, page)
 ```
 
 **关键代码**：
-- 前端动作发射：`src/context/browserSteps.tsx` [L152-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/context/browserSteps.tsx#L152-L226)
-- 后端动作处理：`server/src/browser-management/inputHandlers.ts` [L75-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/inputHandlers.ts#L75-L103)
+- 前端动作发射：`src/context/browserSteps.tsx` L152-L226
+- 后端动作处理：`server/src/browser-management/inputHandlers.ts` L75-L103
 
 ### 7.4 键盘输入流
 
@@ -518,7 +518,7 @@ socket.emit('dom:keypress', { selector, key, inputType, ... })
            ▼  ③ 生成 press 动作，addPairToWorkflowAndNotifyClient
 ```
 
-**保存优化**：`Generator.optimizeWorkflow` 在保存时将连续 `press` 合并为 `type` 动作：`server/src/workflow-management/classes/Generator.ts` [L1417-L1518](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/workflow-management/classes/Generator.ts#L1417-L1518)
+**保存优化**：`Generator.optimizeWorkflow` 在保存时将连续 `press` 合并为 `type` 动作：`server/src/workflow-management/classes/Generator.ts` L1417-L1518
 
 ---
 
@@ -637,19 +637,19 @@ socket.emit('dom:keypress', { selector, key, inputType, ... })
 - 中层 `handleWrapper`：获取活跃浏览器，检查解释器状态
 - 内层 `handleXxx`：实际的业务逻辑
 
-代码示例：`server/src/browser-management/inputHandlers.ts` [L28-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/inputHandlers.ts#L28-L57)
+代码示例：`server/src/browser-management/inputHandlers.ts` L28-L57
 
 ### 10.2 广播模式（Broadcast Pattern）
 
 使用 `socket.nsp.emit()` 向命名空间内所有客户端广播，确保重连后新的 Socket 也能收到消息。
 
-代码：`server/src/browser-management/classes/RemoteBrowser.ts` [L206-L216](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L206-L216)
+代码：`server/src/browser-management/classes/RemoteBrowser.ts` L206-L216
 
 ### 10.3 引用计数 Socket 缓存
 
 前端 `browserSocket.ts` 使用引用计数管理 Socket 连接，多个组件共享同一连接。
 
-代码：`src/utils/browserSocket.ts` [L4-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/src/utils/browserSocket.ts#L4-L45)
+代码：`src/utils/browserSocket.ts` L4-L45
 
 ### 10.4 乐观 UI 更新
 
@@ -674,7 +674,7 @@ socket.emit('dom:keypress', { selector, key, inputType, ... })
 
 ## 十二、性能优化点
 
-1. **rrweb 采样配置**：`server/src/browser-management/classes/RemoteBrowser.ts` [L388-L396](file:///d:/fz/0601-2/solo-dogfeeding/code/108-maxun/server/src/browser-management/classes/RemoteBrowser.ts#L388-L396)
+1. **rrweb 采样配置**：`server/src/browser-management/classes/RemoteBrowser.ts` L388-L396
    - `mousemove: false`（禁用鼠标移动采样）
    - `scroll: 75ms`（滚动采样间隔）
    - `input: 'last'`（输入只保留最后一个）
