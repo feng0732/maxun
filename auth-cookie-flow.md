@@ -832,3 +832,407 @@ Graphile Worker (后台任务)
 6. **无凭据历史**：每次保存都会覆盖 Workflow 中的值，无法追溯凭据变更历史
 7. **排队任务无浏览器**：进入 `queued` 状态的 Run 不会立即创建浏览器，出队时才创建
 8. **异步初始化风险**：浏览器初始化可能失败，但任务已入队，需额外的失败处理逻辑
+
+---
+
+## 十三、工作流快照 vs 最新配置：核心结论
+
+### 13.1 Run 模型结构确认
+
+**关键结论：Run 不保存任何工作流快照。**
+
+[server/src/models/Run.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/models/Run.ts) 的字段定义中，与执行内容相关的字段仅有：
+
+```typescript
+interface RunAttributes {
+  // ...
+  robotMetaId: string;                    // 仅保存 robotMetaId 关联
+  interpreterSettings: InterpreterSettings; // 仅保存 formats、params 等设置
+  // 无 recording 字段，无 workflow 字段
+}
+```
+
+Run 表存储的内容：
+- ✅ `robotMetaId`：用于关联查询 Robot 表
+- ✅ `interpreterSettings`：包含 `formats`、`params`、`promptInstructions`、`robotType` 等
+- ❌ **不存储** workflow / recording 的任何快照副本
+
+### 13.2 所有执行路径均实时从 Robot 读取
+
+代码全局搜索确认，**所有执行入口都在执行前瞬间通过 `robotMetaId` 实时查询 Robot 表的最新配置**。
+
+| 执行路径 | 代码位置 | 读取 recording 的代码 |
+|----------|----------|----------------------|
+| 手动 Run（Graphile Worker） | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts#L218) L218 | `Robot.findOne({ where: { 'recording_meta.id': plainRun.robotMetaId } })` |
+| 文档提取 Run | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts#L157) L157 | 同上 L157 |
+| 文档解析 Run | [task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts#L170) L170 | 同上 L170 |
+| 定时调度 Run | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/scheduler/index.ts#L248) L248 | 同上 |
+| 排队 Run 创建浏览器阶段 | [storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts#L1512) L1512 | 同上（仅验证存在性） |
+| 定时调度启动前检查 | [scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/scheduler/index.ts#L44) L44 | 同上 |
+
+### 13.3 processRunExecution 读取流程详解
+
+[server/src/task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts) L130-L219
+
+```typescript
+async function processRunExecution(data: ExecuteRunData): Promise<void> {
+  // 1. 先读取 Run 记录（里面只有 robotMetaId，没有 workflow）
+  const run = await Run.findOne({ where: { runId: data.runId } });
+  const plainRun = run.toJSON();
+
+  // 2. 如果是 queued 状态，说明是陈旧任务，直接跳过
+  if (run.status === 'queued') {
+    logger.log('info', `Run ${data.runId} has status 'queued', skipping stale execution job`);
+    return;
+  }
+
+  // ... 等待浏览器就绪（轮询最多60秒）...
+
+  // 3. ⚠️ 关键：执行前瞬间从 Robot 表读取最新配置（包括烧录的凭据）
+  const recording = await Robot.findOne({ 
+    where: { 'recording_meta.id': plainRun.robotMetaId }, 
+    raw: true 
+  });
+  if (!recording) throw new Error(`Recording for run ${data.runId} not found`);
+
+  // 4. 将最新 recording 传给解释器执行
+  const interpretationPromise = browser.interpreter.InterpretRecording(
+    AddGeneratedFlags(recording.recording),  // 读取最新 workflow
+    currentPage,
+    (newPage: Page) => currentPage = newPage,
+    plainRun.interpreterSettings,
+  );
+  // ...
+}
+```
+
+### 13.4 定时调度执行同样读取最新配置
+
+[server/src/workflow-management/scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/scheduler/index.ts) L248-L584
+
+```typescript
+// 调度执行前同样实时读取 Robot
+const recording = await Robot.findOne({ 
+  where: { 'recording_meta.id': plainRun.robotMetaId }, 
+  raw: true 
+});
+
+// ... 执行 scrape robot 逻辑 ...
+
+// workflow robot 同样使用最新 recording
+const workflow = AddGeneratedFlags(recording.recording);
+const interpretationPromise = browser.interpreter.InterpretRecording(
+  workflow, currentPage, (newPage: Page) => currentPage = newPage, plainRun.interpreterSettings
+);
+```
+
+---
+
+## 十四、排队（queued）与恢复执行流程详解
+
+### 14.1 进入排队状态的场景
+
+**场景1：浏览器槽位不足（Run 创建时）**
+
+[server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) L1077-L1095
+
+```typescript
+if (!canCreateBrowser) {
+  const browserId = uuid(); 
+  await Run.create({
+    status: 'queued',           // ⚠️ 标记为排队
+    name: recording.recording_meta.name,
+    robotId: recording.id,
+    robotMetaId: recording.recording_meta.id,
+    startedAt: new Date().toLocaleString(),
+    finishedAt: '',
+    browserId: browserId,       // 仅占位，此时未实际创建浏览器
+    interpreterSettings: req.body,
+    log: 'Run queued - waiting for available browser slot',
+    runId,
+    runByUserId: req.user.id,
+    serializableOutput: {},
+    binaryOutput: {},
+  });
+  
+  return res.send({
+    browserId: browserId,
+    runId: runId,
+    robotMetaId: recording.recording_meta.id,
+    queued: true 
+  });
+}
+```
+
+**场景2：服务崩溃恢复（孤儿 Run）**
+
+[server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) L1572-L1643
+
+服务启动时调用 `recoverOrphanedRuns()`，将 `status='running'` 或 `'scheduled'` 但浏览器已不存在的 Run 重新标记为 `queued`：
+
+```typescript
+export async function recoverOrphanedRuns() {
+  const orphanedRuns = await Run.findAll({
+    where: { status: ['running', 'scheduled'] },  // 疑似崩溃的 Run
+    order: [['startedAt', 'ASC']]
+  });
+
+  for (const run of orphanedRuns) {
+    const runData = run.toJSON();
+    const browser = browserPool.getRemoteBrowser(runData.browserId);
+
+    if (!browser) {
+      // 浏览器已不存在，说明是服务崩溃遗留的 Run
+      const retryCount = runData.retryCount || 0;
+      
+      if (retryCount < 3) {
+        await run.update({
+          status: 'queued',    // 重新排队
+          retryCount: retryCount + 1,
+          serializableOutput: {},
+          binaryOutput: {},
+          browserId: undefined,  // 清除无效的 browserId
+          log: `...[RETRY ${retryCount + 1}/3] Re-queuing due to server crash`
+        });
+      } else {
+        // 超过3次重试，标记为失败
+        await run.update({
+          status: 'failed',
+          finishedAt: new Date().toLocaleString(),
+          log: 'Max retries exceeded (3/3)...'
+        });
+      }
+    }
+  }
+}
+```
+
+### 14.2 排队 Run 的轮询处理机制
+
+**定时轮询**：[server/src/server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/server.ts) L151-L158
+
+服务启动后每 **5 秒** 执行一次 `processQueuedRuns()`：
+
+```typescript
+const processQueuedRunsInterval = setInterval(async () => {
+  try {
+    await processQueuedRuns();
+  } catch (error: any) {
+    logger.log('error', `Error in processQueuedRuns interval: ${error.message}`);
+  }
+}, 5000);  // 每 5 秒轮询一次
+```
+
+### 14.3 排队 Run 的出队执行流程
+
+[server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) L1493-L1566
+
+```typescript
+async function processQueuedRuns() {
+  // 熔断器：数据库连续错误时暂停处理
+  if (Date.now() < circuitBreakerOpenUntil) return;
+
+  // 1. 取出最旧的一条 queued Run（按 startedAt 升序）
+  const queuedRun = await Run.findOne({
+    where: { status: 'queued' },
+    order: [['startedAt', 'ASC']],
+  });
+  if (!queuedRun) return;
+
+  const userId = queuedRun.runByUserId;
+  const canCreateBrowser = await browserPool.hasAvailableBrowserSlots(userId, "run");
+
+  if (canCreateBrowser) {
+    // 2. ⚠️ 从 Robot 读取最新配置（含最新凭据）
+    const recording = await Robot.findOne({
+      where: { 'recording_meta.id': queuedRun.robotMetaId },
+      raw: true
+    });
+
+    if (!recording) {
+      await queuedRun.update({ status: 'failed', log: 'Recording not found' });
+      return;
+    }
+
+    // 3. 创建新浏览器
+    const newBrowserId = await createRemoteBrowserForRun(userId);
+
+    // 4. 更新 Run 状态为 running，分配新的 browserId
+    await queuedRun.update({
+      status: 'running',
+      browserId: newBrowserId,   // 覆盖之前的占位 browserId
+      log: 'Browser created and ready for execution'
+    });
+
+    // 5. 加入执行队列（实际执行时会再次读取 Robot 最新配置）
+    const jobId = await addJob(QUEUE_NAMES.EXECUTE_RUN, {
+      userId: userId,
+      runId: queuedRun.runId,
+      browserId: newBrowserId,
+    }, { maxAttempts: 1 });
+  }
+}
+```
+
+### 14.4 queued 状态的 stale 任务防护
+
+[server/src/task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts) L148-L151
+
+Graphile Worker 的旧任务可能因为延迟在 Run 已转为 queued 后才执行，此时会被直接跳过：
+
+```typescript
+if (run.status === 'queued') {
+  logger.log('info', `Run ${data.runId} has status 'queued', skipping stale execution job`);
+  return;  // 直接返回，不执行
+}
+```
+
+---
+
+## 十五、凭据变更对不同状态 Run 的影响分析
+
+### 15.1 核心结论
+
+**凭据变更（编辑保存）会影响所有尚未进入内存执行阶段的 Run，包括 queued 和 scheduled 状态的 Run。**
+
+### 15.2 各状态 Run 受影响情况
+
+| Run 状态 | 凭据变更是否影响 | 原因 |
+|----------|-----------------|------|
+| **draft（未创建）** | — | 还不存在 Run |
+| **queued（排队中）** | ✅ **影响** | 执行时（`processQueuedRuns` → `processRunExecution`）会实时读取 Robot 最新配置 |
+| **scheduled（调度待执行）** | ✅ **影响** | 调度执行时（scheduler）会实时读取 Robot 最新配置 |
+| **running（执行中）** | ❌ 不影响 | `recording` 已加载到内存，解释器使用内存中的副本执行 |
+| **success / failed / aborted** | ❌ 不影响 | 已执行完成 |
+
+### 15.3 时序场景举例
+
+#### 场景 A：快速连续保存并启动
+
+```
+T0:  用户编辑凭据为 CredA，点击保存
+       → PUT /recordings/:id { credentials: CredA }
+       → handleWorkflowActions() 把 CredA 加密烧录到 Robot.workflow
+       → 数据库 Robot.recording.workflow = [含 CredA]
+       → 前端调用 handleStart() 启动 Run
+
+T1:  PUT /runs/:id 创建 Run，status='running'，browserId=xxx
+       → addJob(EXECUTE_RUN, {runId, browserId})
+
+T2:  用户立即再次编辑，将凭据改为 CredB 并保存
+       → PUT /recordings/:id { credentials: CredB }
+       → Robot.recording.workflow = [含 CredB]  ✅ 已更新
+
+T3:  Graphile Worker 消费任务 → processRunExecution()
+       → Robot.findOne() 读取 Robot
+       → 拿到的是 CredB 的 workflow ❗
+       → 使用 CredB 执行
+```
+
+**结果**：即使用户本意是用 CredA 执行，但如果保存 CredB 的速度足够快（在 T3 之前完成），Run 实际使用的是 CredB。
+
+#### 场景 B：排队期间修改凭据
+
+```
+T0:  用户启动 Run，因浏览器槽位满进入 queued 状态
+       → Run.status='queued'，创建时凭据为 CredA
+
+T1:  5 秒后，processQueuedRuns() 轮询但仍无槽位，Run 保持 queued
+
+T2:  用户编辑凭据为 CredB 并保存
+       → Robot.recording.workflow = [含 CredB]
+
+T3:  下一个 5 秒轮询，processQueuedRuns() 发现有槽位
+       → Robot.findOne() 读到 CredB
+       → 创建浏览器，Run.status='running'
+       → addJob(EXECUTE_RUN)
+
+T4:  processRunExecution() 执行
+       → Robot.findOne() 再次读到 CredB
+       → 使用 CredB 执行 ✅
+```
+
+**结果**：排队期间修改凭据，出队执行时使用的是**最新**的 CredB。
+
+#### 场景 C：执行中修改凭据
+
+```
+T0:  processRunExecution() 已执行到 L218
+       → const recording = await Robot.findOne(...)
+       → recording.workflow 在内存中，含 CredA
+
+T1:  用户保存 CredB，Robot 表已更新
+
+T2:  解释器 InterpretRecording() 使用内存中的 recording 副本
+       → 解密出 CredA 并执行
+       → 不受 T1 保存的 CredB 影响
+```
+
+**结果**：执行中修改凭据不影响当前 Run。
+
+### 15.4 多 Run 共享同一 Robot 的影响
+
+由于所有 Run 都通过 `robotMetaId` 关联到同一条 Robot 记录：
+
+- **同一 Robot 的多个 queued Run**：如果在排队期间修改凭据，**所有**尚未执行的 Run 都会使用新凭据
+- **定时调度的 Run**：每次调度触发时都会读取最新凭据，因此调度执行始终使用当前 Robot 配置
+- **无隔离**：没有"创建 Run 时冻结配置快照"的机制，用户无法为不同 Run 指定不同凭据版本
+
+---
+
+## 十六、关键代码位置速查（最终版）
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| AES 加密 | [server/src/utils/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/utils/auth.ts) | L26-L43 |
+| AES 解密 | [server/src/utils/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/utils/auth.ts) | L45-L60 |
+| 录制时加密键盘输入 | [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/classes/Generator.ts) | L476 |
+| 优化时加密合并的 type 动作 | [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/classes/Generator.ts) | L1506 |
+| 保存 isLogin 标志 | [server/src/workflow-management/classes/Generator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/classes/Generator.ts) | L1099 |
+| 创建全新 BrowserContext | [server/src/browser-management/classes/RemoteBrowser.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/browser-management/classes/RemoteBrowser.ts) | L522 |
+| 执行前解密凭据 | [server/src/workflow-management/classes/Interpreter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/classes/Interpreter.ts) | L28-L33 |
+| **凭据覆盖（编辑保存时）** | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L290-L355 |
+| **编辑配置保存入口** | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L373-L556 |
+| **Run 启动入口（含 queued 创建）** | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L997-L1131 |
+| **排队 Run 轮询处理** | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L1493-L1566 |
+| **崩溃孤儿 Run 恢复** | [server/src/routes/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/routes/storage.ts) | L1572-L1643 |
+| **Run 执行核心（实时读取 Robot）** | [server/src/task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts) | L130-L581 |
+| **queued 状态 stale 任务防护** | [server/src/task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts) | L148-L151 |
+| 任务队列注册 | [server/src/task-runner.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/task-runner.ts) | L631-L675 |
+| 创建浏览器（Run） | [server/src/browser-management/controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/browser-management/controller.ts) | L114-L137 |
+| Graphile Worker 入队 | [server/src/storage/graphileWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/storage/graphileWorker.ts) | L61-L71 |
+| **定时调度执行（实时读取 Robot）** | [server/src/workflow-management/scheduler/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/workflow-management/scheduler/index.ts) | L248-L591 |
+| **轮询定时器注册** | [server/src/server.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/server.ts) | L151-L158 |
+| Run 数据模型（无 workflow 快照） | [server/src/models/Run.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/models/Run.ts) | L14-L157 |
+| 前端编辑保存 | [src/components/robot/pages/RobotEditPage.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/src/components/robot/pages/RobotEditPage.tsx) | L1203-L1326 |
+| 前端更新 API | [src/api/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/src/api/storage.ts) | L115-L130 |
+| 前端 Run API | [src/api/storage.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/src/api/storage.ts) | L288-L302 |
+| 读取 Cookie 用于 where 匹配 | [maxun-core/src/interpret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/maxun-core/src/interpret.ts) | L271 |
+| Robot 数据模型 | [server/src/models/Robot.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/115-maxun/server/src/models/Robot.ts) | - |
+
+---
+
+## 十七、更新：设计特点与限制（最终补充）
+
+### 设计特点总结（完整）
+1. **无状态设计**：每次 Run 完全独立，避免了跨任务的登录态污染
+2. **凭据加密**：敏感数据 AES-256-CBC 加密存储，符合安全要求
+3. **灵活覆盖**：支持通过 Credentials 机制在运行时替换录制的凭据值，便于多环境/多账号使用
+4. **提前烧录**：凭据在编辑保存时就被加密合并到 Workflow 中，Run 启动时无需额外处理
+5. **并行初始化**：浏览器初始化与任务入队并行进行，优化了冷启动时间
+6. **队列解耦**：通过 Graphile Worker 队列实现请求处理与实际执行的解耦
+7. **配置即最新**：所有执行路径实时读取 Robot 最新配置，确保凭据变更立即生效
+8. **故障自动恢复**：服务崩溃后自动检测孤儿 Run 并重试排队（最多3次）
+
+### 限制与风险（完整）
+1. **每次都需重新登录**：无 Cookie 持久化，Run 开始必须重新执行完整登录流程，增加了执行时间
+2. **isLogin 标志未被实际使用**：虽然录制时保存了 `isLogin`，但后续代码未基于此标志做特殊处理（如提取保存 Cookie）
+3. **登录态随 Run 销毁**：BrowserContext 在 Run 结束后即销毁，无法在多个 Run 间共享登录态
+4. **无会话续期机制**：如果登录态在长 Run 中过期，没有自动续期能力
+5. **凭据明文传输**：编辑保存时 credentials 以明文通过 HTTP 发送（需 HTTPS 保护）
+6. **无凭据历史**：每次保存都会覆盖 Workflow 中的值，无法追溯凭据变更历史
+7. **排队任务无浏览器**：进入 `queued` 状态的 Run 不会立即创建浏览器，出队时才创建
+8. **异步初始化风险**：浏览器初始化可能失败，但任务已入队，需额外的失败处理逻辑
+9. **⚠️ 无工作流快照**：Run 创建时不冻结 workflow 配置快照，执行前读取最新 Robot 配置。如果用户在 Run queued/scheduled 期间修改凭据，所有待执行 Run 都会受影响
+10. **⚠️ 保存与执行竞态**：用户快速连续保存不同凭据时，先启动的 Run 可能意外使用后保存的凭据，存在"保存-启动时序竞态"问题
+11. **⚠️ 多 Run 无隔离**：同一 Robot 的多个 queued Run 共享同一份最新配置，无法为不同 Run 锁定不同的凭据版本
